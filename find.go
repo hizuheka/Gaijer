@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"log/slog"
 
 	"github.com/google/subcommands"
 )
@@ -45,15 +46,23 @@ func (p *findCmd) validate() error {
 }
 
 func (p *findCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...any) subcommands.ExitStatus {
+	var err error
+	defer func() {
+		if err != nil {
+			slog.Error(err.Error())
+		}
+	}()
+
 	// 起動時引数のチェック
-	if err := p.validate(); err != nil {
-		return subcommands.ExitFailure
+	if err = p.validate(); err != nil {
+		return subcommands.ExitUsageError
 	}
 
 	// 外字リストファイルを読み込み、外字リスト(gaiji構造体のスライス)を作成する
-	gaijiList, err := createGaijiList("gaijilist.txt")
+	var gaijiList []*gaiji
+	gaijiList, err = createGaijiList("gaijilist.txt")
 	if err != nil {
-		panic(err)
+		return subcommands.ExitFailure
 	}
 	// err := clipboard.Init()
 	// if err != nil {
