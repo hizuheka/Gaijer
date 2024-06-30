@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 
 	"github.com/google/subcommands"
 )
@@ -29,7 +30,31 @@ func (p *findCmd) SetFlags(f *flag.FlagSet) {
 	f.StringVar(&p.gaiji, "g", "", "外字リストファイルのパス")
 }
 
+func (p *findCmd) validate() error {
+	if p.input == "" {
+		return fmt.Errorf("引数 -i が指定されていません。")
+	}
+	if p.output == "" {
+		return fmt.Errorf("引数 -o が指定されていません。")
+	}
+	if p.gaiji == "" {
+		return fmt.Errorf("引数 -g が指定されていません。")
+	}
+
+	return nil
+}
+
 func (p *findCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...any) subcommands.ExitStatus {
+	// 起動時引数のチェック
+	if err := p.validate(); err != nil {
+		return subcommands.ExitFailure
+	}
+
+	// 外字リストファイルを読み込み、外字リスト(gaiji構造体のスライス)を作成する
+	gaijiList, err := createGaijiList("gaijilist.txt")
+	if err != nil {
+		panic(err)
+	}
 	// err := clipboard.Init()
 	// if err != nil {
 	// 	log.Printf("[clip] %v\n", err)

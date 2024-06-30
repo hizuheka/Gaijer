@@ -13,7 +13,6 @@ import (
 type gaiji struct {
 	moji      rune
 	codepoint string
-	used      bool // 使用有無
 }
 
 // * filename で指定されたファイルから、外字リストを作成する。
@@ -36,7 +35,7 @@ func createGaijiList(fileName string) ([]*gaiji, error) {
 		// 一行ずつ取得。
 		r := []rune(scanner.Text())[0] // runeに変換。1文字目だけ取得
 		// ハッシュリストにセット
-		gaijList = append(gaijList, &gaiji{r, fmt.Sprintf("%x", r), false})
+		gaijList = append(gaijList, &gaiji{r, fmt.Sprintf("%x", r)})
 	}
 
 	// エラー処理

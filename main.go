@@ -23,43 +23,38 @@ func main() {
 	ctx := context.Background()
 	os.Exit(int(subcommands.Execute(ctx)))
 
-	// * 外字リストファイルを読み込み、外字ハッシュマップ（HashMap（外字、外字構造体））を作成する
-	gaijiList, err := createGaijiList("gaijilist.txt")
-	if err != nil {
-		panic(err)
-	}
-	fpIn, err := os.Open("input.txt")
-	if err != nil {
-		panic(err)
-	}
-	defer fpIn.Close()
+	// fpIn, err := os.Open("input.txt")
+	// if err != nil {
+	// 	panic(err)
+	// }
+	// defer fpIn.Close()
 
-	for {
-		reader := bufio.NewReaderSize(fpIn, 1000*10)
-		chunk, err := readFileByChunk(reader, 1000)
-		if err != nil {
-			break
-		}
-		// todo 外字ハッシュリストの、外字構造体の使用有無がfalseのものを対象に、繰り返し処理する
-		for _, v := range gaijiList {
-			if !v.used {
-				// todo 検索対象の100バイトの中に、外字が含まれるかを調べる
-				// * 読み込んだバイト配列の中に、外字が含まれるかを調べる。
-				// * 読み込んだバイト配列の2バイト文字はリトルエンディアンとなっているため、
-				// * 外字はリトルエンディアンに変換する。
-				b := [2]byte{}
-				copy(b[:], []byte(string(v.moji)))
-				if contains(chunk, swap(b)) {
-					// * 外字が含まれた場合は、外字構造体の使用有無に、trueをセットする
-					v.used = true
-				}
-			}
-		}
-	}
+	// for {
+	// 	reader := bufio.NewReaderSize(fpIn, 1000*10)
+	// 	chunk, err := readFileByChunk(reader, 1000)
+	// 	if err != nil {
+	// 		break
+	// 	}
+	// 	// todo 外字ハッシュリストの、外字構造体の使用有無がfalseのものを対象に、繰り返し処理する
+	// 	for _, v := range gaijiList {
+	// 		if !v.used {
+	// 			// todo 検索対象の100バイトの中に、外字が含まれるかを調べる
+	// 			// * 読み込んだバイト配列の中に、外字が含まれるかを調べる。
+	// 			// * 読み込んだバイト配列の2バイト文字はリトルエンディアンとなっているため、
+	// 			// * 外字はリトルエンディアンに変換する。
+	// 			b := [2]byte{}
+	// 			copy(b[:], []byte(string(v.moji)))
+	// 			if contains(chunk, swap(b)) {
+	// 				// * 外字が含まれた場合は、外字構造体の使用有無に、trueをセットする
+	// 				v.used = true
+	// 			}
+	// 		}
+	// 	}
+	// }
 
-	for n, v := range gaijiList {
-		fmt.Printf("%v:%s-%v", n, string(v.moji), v.used)
-	}
+	// for n, v := range gaijiList {
+	// 	fmt.Printf("%v:%s-%v", n, string(v.moji), v.used)
+	// }
 }
 
 // readFileByChunkは、指定されたファイルを指定されたサイズ chunkSize で分割して読み取ります
