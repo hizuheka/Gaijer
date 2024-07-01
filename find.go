@@ -5,12 +5,18 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"io"
 	"log/slog"
 	"os"
+	"strings"
 
 	"github.com/google/subcommands"
 )
+
+type Result struct {
+	moji  rune
+	key   string
+	value string
+}
 
 type findCmd struct {
 	input  string
@@ -67,119 +73,22 @@ func (p *findCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...any) subcomma
 	if err != nil {
 		return subcommands.ExitFailure
 	}
-	// err := clipboard.Init()
-	// if err != nil {
-	// 	log.Printf("[clip] %v\n", err)
-	// 	return subcommands.ExitFailure
-	// }
 
-	// reader := bufio.NewReader(bytes.NewReader(clipboard.Read(clipboard.FmtText)))
-	// for i := 0; ; i++ {
-	// 	if p.num != 0 && i == p.num {
-	// 		break
-	// 	}
-	// 	line, _, err := reader.ReadLine()
-	// 	if err == io.EOF {
-	// 		break
-	// 	} else if err != nil {
-	// 		log.Printf("[clip] %v\n", err)
-	// 		return subcommands.ExitFailure
-	// 	}
+	var results []Result
+	results, err = extractLinesWithGaiji(gaijiList, p.input)
+	if err != nil {
+		return subcommands.ExitFailure
+	}
 
-	// 	out := string(line)
-	// 	if p.trim {
-	// 		out = strings.TrimSpace(out)
-	// 	}
-	// 	fmt.Println(out)
-	// }
+	err = writeFile(p.output, results)
+	if err != nil {
+		return subcommands.ExitFailure
+	}
 
 	return subcommands.ExitSuccess
 }
 
-// 入力ファイルを処理し、出力ファイルに書き出す
-func processInputFile(inputFilePath, outputFilePath string, gaijiList []*gaiji) error {
-	inputFile, err := os.Open(inputFilePath)
-	if err != nil {
-		return err
-	}
-	defer inputFile.Close()
-
-	// ファイルサイズ
-	fi, err := inputFile.Stat()
-	if err != nil {
-		return err
-	}
-	filesize := fi.Size()
-
-	outputFile, err := os.Create(outputFilePath)
-	if err != nil {
-		return err
-	}
-	defer outputFile.Close()
-
-	r := bufio.NewReader(inputFile)
-	writer := bufio.NewWriter(outputFile)
-	defer writer.Flush()
-
-	var c int64 = 0
-	var oldP int64 = 0
-	for {
-		line, err := r.ReadString('\n') // LF(\n)まで読み込むので、CRLF(\r\n)でも問題なし
-		if err != nil && err != io.EOF {
-			return err
-		}
-		// 最終行に改行がない場合を考慮し、len(row) == 0 を入れる
-		if err == io.EOF && len(line) == 0 {
-			break
-		}
-
-		for _, char := range line {
-			if searchChars[char] {
-				return true
-			}
-		}
-		return false
-		if containsSearchChar(line, gaijiList) {
-			_, err := writer.WriteString(line)
-			if err != nil {
-				return err
-			}
-		}
-
-		c = c + int64(len(line))
-		p := c / (filesize / 100)
-		if p != oldP {
-			fmt.Printf("\rReading: %2d%%", p)
-			// fmt.Printf("Reading: %2d%%\n", p)
-			oldP = p
-		}
-	}
-
-	fmt.Printf("\nfile size=%d, read size=%d", filesize, c)
-
-	return nil
-}
-
-// 行に検索対象文字が含まれているかチェックする
-func containsSearchChar(line string, searchChars map[rune]bool) bool {
-	for _, char := range line {
-		if searchChars[char] {
-			return true
-		}
-	}
-	return false
-}
-
-type rule struct {
-	Character string
-}
-
-type Result struct {
-	Character string
-	Line      string
-}
-
-func extractLinesWithGaiji(gaijiList []rule, inputFile string) ([]Result, error) {
+func extractLinesWithGaiji(gaijiList []*gaiji, inputFile string) ([]Result, error) {
 	var results []Result
 
 	file, err := os.Open(inputFile)
@@ -191,10 +100,13 @@ func extractLinesWithGaiji(gaijiList []rule, inputFile string) ([]Result, error)
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		line := scanner.Text()
-		for _, r := range gaijiList {
-			if contains(line, r.Character) {
-				results = append(results, Result{Character: r.Character, Line: line})
-				break
+		a := strings.Split(line, ",")
+		if len(a) != 2 {
+			return nil, fmt.Errorf("入力ファイルの形式エラー。入力ファイルはカンマ区切り2列を想定。line=%s", line)
+		}
+		for _, g := range gaijiList {
+			if strings.Contains(a[1], string(g.moji)) {
+				results = append(results, Result{moji: g.moji, key: a[0], value: a[1]})
 			}
 		}
 	}
@@ -206,6 +118,23 @@ func extractLinesWithGaiji(gaijiList []rule, inputFile string) ([]Result, error)
 	return results, nil
 }
 
-func contains(line, gaiji string) bool {
-	return len(gaiji) > 0 && len(line) >= len(gaiji) && (line == gaiji || (len(line) > len(gaiji) && (contains(line[1:], gaiji) || contains(line[:len(line)-1], gaiji))))
+// 出力ファイルに書き出す
+func writeFile(outputFilePath string, results []Result) error {
+	outputFile, err := os.Create(outputFilePath)
+	if err != nil {
+		return err
+	}
+	defer outputFile.Close()
+
+	w := bufio.NewWriter(outputFile)
+	defer w.Flush()
+
+	for _, r := range results {
+		_, err := w.WriteString(fmt.Sprintf("%s,%s,%s", r.moji, r.key, r.value))
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
