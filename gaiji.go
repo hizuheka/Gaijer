@@ -19,7 +19,8 @@ type gaiji struct {
 // * filename には、UTF16BE、BOMなし、1行に外字1文字が出力されている。
 func createGaijiList(fileName string) ([]*gaiji, error) {
 	// ハッシュリストを定義
-	gaijList := make([]*gaiji, 2000)
+	// gaijiList := make([]*gaiji, 2000)
+	var gaijiList []*gaiji
 
 	// 入力ファイルを開く
 	fp, err := os.Open(fileName)
@@ -34,8 +35,9 @@ func createGaijiList(fileName string) ([]*gaiji, error) {
 	for scanner.Scan() {
 		// 一行ずつ取得。
 		r := []rune(scanner.Text())[0] // runeに変換。1文字目だけ取得
+		fmt.Println(string(r))
 		// ハッシュリストにセット
-		gaijList = append(gaijList, &gaiji{r, fmt.Sprintf("%x", r)})
+		gaijiList = append(gaijiList, &gaiji{r, fmt.Sprintf("%x", r)})
 	}
 
 	// エラー処理
@@ -43,5 +45,6 @@ func createGaijiList(fileName string) ([]*gaiji, error) {
 		return nil, err
 	}
 
-	return gaijList, nil
+	fmt.Printf("len(gaijiList)=%d\n", len(gaijiList))
+	return gaijiList, nil
 }

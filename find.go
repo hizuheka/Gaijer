@@ -60,7 +60,10 @@ func (p *findCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...any) subcomma
 		if err != nil {
 			slog.Error(err.Error())
 		}
+		slog.Info("END")
 	}()
+
+	slog.Info("START")
 
 	// 起動時引数のチェック
 	if err = p.validate(); err != nil {
@@ -69,7 +72,7 @@ func (p *findCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...any) subcomma
 
 	// 外字リストファイルを読み込み、外字リスト(gaiji構造体のスライス)を作成する
 	var gaijiList []*gaiji
-	gaijiList, err = createGaijiList("gaijilist.txt")
+	gaijiList, err = createGaijiList(p.gaiji)
 	if err != nil {
 		return subcommands.ExitFailure
 	}
@@ -105,6 +108,7 @@ func extractLinesWithGaiji(gaijiList []*gaiji, inputFile string) ([]Result, erro
 			return nil, fmt.Errorf("入力ファイルの形式エラー。入力ファイルはカンマ区切り2列を想定。line=%s", line)
 		}
 		for _, g := range gaijiList {
+			fmt.Println(g)
 			if strings.Contains(a[1], string(g.moji)) {
 				results = append(results, Result{moji: g.moji, key: a[0], value: a[1]})
 			}
