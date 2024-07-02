@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"log/slog"
 	"os"
 
 	"golang.org/x/text/encoding/unicode"
@@ -29,13 +30,12 @@ func createGaijiList(fileName string) ([]*gaiji, error) {
 	}
 	defer fp.Close()
 
-	// 入力ファイルを読み込む
-	reader := bufio.NewReader(transform.NewReader(fp, unicode.UTF16(unicode.BigEndian, unicode.IgnoreBOM).NewDecoder()))
+	// 入力ファイルを読み込む。BOMが付いていた場合も考慮。
+	reader := bufio.NewReader(transform.NewReader(fp, unicode.BOMOverride(unicode.UTF16(unicode.BigEndian, unicode.IgnoreBOM).NewDecoder())))
 	scanner := bufio.NewScanner(reader)
 	for scanner.Scan() {
 		// 一行ずつ取得。
 		r := []rune(scanner.Text())[0] // runeに変換。1文字目だけ取得
-		fmt.Println(string(r))
 		// ハッシュリストにセット
 		gaijiList = append(gaijiList, &gaiji{r, fmt.Sprintf("%x", r)})
 	}
@@ -45,6 +45,7 @@ func createGaijiList(fileName string) ([]*gaiji, error) {
 		return nil, err
 	}
 
-	fmt.Printf("len(gaijiList)=%d\n", len(gaijiList))
+	slog.Info(fmt.Sprintf("外字リストを読み込みました。(外字リスト数=%d)", len(gaijiList)))
+
 	return gaijiList, nil
 }

@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/csv"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -83,7 +84,7 @@ func (p *findCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...any) subcomma
 		return subcommands.ExitFailure
 	}
 
-	err = writeFile(p.output, results)
+	err = writeOutputFile(p.output, results)
 	if err != nil {
 		return subcommands.ExitFailure
 	}
@@ -108,7 +109,6 @@ func extractLinesWithGaiji(gaijiList []*gaiji, inputFile string) ([]Result, erro
 			return nil, fmt.Errorf("入力ファイルの形式エラー。入力ファイルはカンマ区切り2列を想定。line=%s", line)
 		}
 		for _, g := range gaijiList {
-			fmt.Println(g)
 			if strings.Contains(a[1], string(g.moji)) {
 				results = append(results, Result{moji: g.moji, key: a[0], value: a[1]})
 			}
@@ -119,23 +119,29 @@ func extractLinesWithGaiji(gaijiList []*gaiji, inputFile string) ([]Result, erro
 		return nil, err
 	}
 
+	slog.Info(fmt.Sprintf("入力ファイルから対象データを抽出しました。(抽出件数=%d)", len(results)))
+
 	return results, nil
 }
 
 // 出力ファイルに書き出す
-func writeFile(outputFilePath string, results []Result) error {
+func writeOutputFile(outputFilePath string, results []Result) error {
+	// 出力ファイルを開く
 	outputFile, err := os.Create(outputFilePath)
 	if err != nil {
 		return err
 	}
 	defer outputFile.Close()
 
-	w := bufio.NewWriter(outputFile)
-	defer w.Flush()
+	writer := csv.NewWriter(outputFile)
+	defer writer.Flush()
 
+	// ヘッダーを書き込む
+	writer.Write([]string{"文字", "キー", "値"})
+
+	// ログエントリを書き込む
 	for _, r := range results {
-		_, err := w.WriteString(fmt.Sprintf("%s,%s,%s", r.moji, r.key, r.value))
-		if err != nil {
+		if err := writer.Write([]string{string(r.moji), r.key, r.value}); err != nil {
 			return err
 		}
 	}
