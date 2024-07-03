@@ -134,6 +134,7 @@ func writeOutputFile(outputFilePath string, results []Result) error {
 	defer outputFile.Close()
 
 	writer := csv.NewWriter(outputFile)
+	// writer.UserCRLF(true)
 	defer writer.Flush()
 
 	// ヘッダーを書き込む
