@@ -9,9 +9,9 @@ import (
 	"log/slog"
 	"os"
 	"strings"
-	"sync"
 
 	"github.com/google/subcommands"
+	"golang.org/x/sync/errgroup"
 )
 
 type Result struct {
@@ -84,19 +84,25 @@ func (p *findCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...any) subcomma
 	// - タスクの数に合わせてバッファサイズを設定する
 	const numJobs = 5
 	jobs := make(chan string, numJobs)
-	results := make(chan Result, numJobs)
+	resultChan := make(chan Result, numJobs)
 
 	// ワーカープール作成
 	// - `numWorkers` で指定した数のワーカーを生成する。各ワーカーは`worker`関数を実行するゴルーチンとして起動される
 	// - 各ワーカーには一意のID(i)を与え、`jobs`チャネルからタスクを受け取って処理し、その結果を`results`チャネルに送信する
+	_ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	eg, ctx := errgroup.WithContext(_ctx)
 	const numWorkers = 3
-	var wg sync.WaitGroup
-	for i := 1: i <= numWorkers; i++ {
-		wg.Addi(1)
-		go func(i int) {
-			defer wg.Done()
-			worker(i, jobs, results, gaijiList)
-		}(i)
+	// var wg sync.WaitGroup
+	for i := 1; i <= numWorkers; i++ {
+		// wg.Addi(1)
+		i := i
+		// go func(i int) {
+		eg.Go(func() error {
+			// defer wg.Done()
+			return worker(ctx, i, jobs, resultChan, gaijiList)
+		})
+		// }(i)
 	}
 
 	// タスク割り当て
@@ -105,25 +111,25 @@ func (p *findCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...any) subcomma
 	for j := 1; j <= numJobs; j++ {
 		jobs <- j
 	}
+	close(jobs)
 
 	// ワーカー完了待機
 	// - `sync.WaitGroup`を使用して、全てのワーカーの処理が完了するの待ちます。各ワーカーが完了すると`wg.Done`が呼び出され、全てのワーカーが完了すると待機が解除される
 	// - 全てのワーカーが完了し、全てのタスクの処理が終わった後、`results`チャネルをクローズする
-	wg.Wait()
-	close(results)
+	go func() {
+		// wg.Wait()
+		err = eg.Wait()
+		close(resultChan)
+	}()
 
 	// 結果の出力
 	// - `results`チャネルからタスクの処理結果を受け取り、出力する。
-	for i := 1; i <= numJobs; i++ {
-		<- results
-	}
-
-	results, err = extractLinesWithGaiji(gaijiList, p.input)
+	err = writeOutputFile(p.output, resultChan)
 	if err != nil {
 		return subcommands.ExitFailure
 	}
 
-	err = writeOutputFile(p.output, results)
+	results, err = extractLinesWithGaiji(gaijiList, p.input)
 	if err != nil {
 		return subcommands.ExitFailure
 	}
@@ -164,7 +170,7 @@ func extractLinesWithGaiji(gaijiList []*gaiji, inputFile string) ([]Result, erro
 }
 
 // 出力ファイルに書き出す
-func writeOutputFile(outputFilePath string, results []Result) error {
+func writeOutputFile(outputFilePath string, resultChan <-chan Result) error {
 	// 出力ファイルを開く
 	outputFile, err := os.Create(outputFilePath)
 	if err != nil {
@@ -180,7 +186,7 @@ func writeOutputFile(outputFilePath string, results []Result) error {
 	writer.Write([]string{"コード", "文字", "キー", "値"})
 
 	// ログエントリを書き込む
-	for _, r := range results {
+	for r := range resultChan {
 		if err := writer.Write([]string{fmt.Sprintf("%X", r.moji), string(r.moji), r.key, r.value}); err != nil {
 			return err
 		}
@@ -192,22 +198,28 @@ func writeOutputFile(outputFilePath string, results []Result) error {
 // ワーカー関数
 // - ワーカーが行うタスクの処理
 // - ジョブキュー(jobs)からタスクを受け取り、それを処理して、結果を結果チャネル(results)に送信する
-func worker(i int, jobs <-chan string, results chan<- Result, gaijiList []*gaiji) {
+func worker(ctx context.Context, i int, jobs <-chan string, results chan<- Result, gaijiList []*gaiji) error {
 	slog.Info(fmt.Sprintf("WORKER:%d START", i))
 	defer func() {
 		slog.Info(fmt.Sprintf("WORKER:%d END", i))
 	}()
 
 	for line := range jobs {
-		a := strings.Split(line, ",")
-		if len(a) != 2 {
-			// fmt.Errorf("入力ファイルの形式エラー。入力ファイルはカンマ区切り2列を想定。line=%s", line)
-			fmt.Printf("入力ファイルの形式エラー。入力ファイルはカンマ区切り2列を想定。line=%s", line)
-		}
-		for _, g := range gaijiList {
-			if strings.Contains(a[1], string(g.moji)) {
-				results <- Result{moji: g.moji, key: a[0], value: a[1]}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			a := strings.Split(line, ",")
+			if len(a) != 2 {
+				return fmt.Errorf("入力ファイルの形式エラー。入力ファイルはカンマ区切り2列を想定。line=%s", line)
+			}
+			for _, g := range gaijiList {
+				if strings.Contains(a[1], string(g.moji)) {
+					results <- Result{moji: g.moji, key: a[0], value: a[1]}
+				}
 			}
 		}
 	}
+
+	return nil
 }
