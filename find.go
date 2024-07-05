@@ -187,8 +187,6 @@ func writeOutputFile(outputFilePath string, resultChan <-chan Result, errChan ch
 			return
 		}
 	}
-
-	return
 }
 
 // ワーカー関数
