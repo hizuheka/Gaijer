@@ -9,9 +9,9 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+	"sync"
 
 	"github.com/google/subcommands"
-	"golang.org/x/sync/errgroup"
 )
 
 type Result struct {
@@ -83,98 +83,90 @@ func (p *findCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...any) subcomma
 	// - `numJobs` で指定した数だけのタスクを処理するため、ジョブキュー (`jobs`)と結果を格納するチャネル(`results`)を準備する
 	// - タスクの数に合わせてバッファサイズを設定する
 	const numJobs = 5
-	jobs := make(chan string, numJobs)
+	jobChan := make(chan string, numJobs)
 	resultChan := make(chan Result, numJobs)
+	errChan := make(chan error, numJobs)
 
 	// ワーカープール作成
 	// - `numWorkers` で指定した数のワーカーを生成する。各ワーカーは`worker`関数を実行するゴルーチンとして起動される
 	// - 各ワーカーには一意のID(i)を与え、`jobs`チャネルからタスクを受け取って処理し、その結果を`results`チャネルに送信する
-	_ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	eg, ctx := errgroup.WithContext(_ctx)
+
 	const numWorkers = 3
-	// var wg sync.WaitGroup
+	var wg sync.WaitGroup
 	for i := 1; i <= numWorkers; i++ {
-		// wg.Addi(1)
-		i := i
-		// go func(i int) {
-		eg.Go(func() error {
-			// defer wg.Done()
-			return worker(ctx, i, jobs, resultChan, gaijiList)
-		})
-		// }(i)
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			if err := worker(ctx, i, jobChan, resultChan, gaijiList); err != nil {
+				cancel()
+				errChan <- err
+			}
+		}(i)
 	}
 
 	// タスク割り当て
 	// - タスク(1からnumJobsまでの数値)をjobsチャネルに送信し、ワーカーに処理させる
 	// - 全てのタスクが`jobs`チャネルに送信された後、`close(jobs)`によりチャネルをクローズする。これにより、追加のタスクがないことがワーカーに通知される
-	for j := 1; j <= numJobs; j++ {
-		jobs <- j
-	}
-	close(jobs)
+	go func() {
+		defer close(jobChan)
+		createJobs(p.input, jobChan, errChan)
+	}()
 
 	// ワーカー完了待機
 	// - `sync.WaitGroup`を使用して、全てのワーカーの処理が完了するの待ちます。各ワーカーが完了すると`wg.Done`が呼び出され、全てのワーカーが完了すると待機が解除される
 	// - 全てのワーカーが完了し、全てのタスクの処理が終わった後、`results`チャネルをクローズする
 	go func() {
-		// wg.Wait()
-		err = eg.Wait()
+		wg.Wait()
 		close(resultChan)
 	}()
 
 	// 結果の出力
 	// - `results`チャネルからタスクの処理結果を受け取り、出力する。
-	err = writeOutputFile(p.output, resultChan)
-	if err != nil {
-		return subcommands.ExitFailure
-	}
+	writeOutputFile(p.output, resultChan, errChan)
+	close(errChan)
 
-	results, err = extractLinesWithGaiji(gaijiList, p.input)
-	if err != nil {
-		return subcommands.ExitFailure
+	// エラー確認
+	for e := range errChan {
+		if e != nil {
+			err = e
+			return subcommands.ExitFailure
+		}
 	}
 
 	return subcommands.ExitSuccess
 }
 
-func extractLinesWithGaiji(gaijiList []*gaiji, inputFile string) ([]Result, error) {
-	var results []Result
-
+// func extractLinesWithGaiji(gaijiList []*gaiji, inputFile string) ([]Result, error) {
+func createJobs(inputFile string, jobChan chan<- string, errChan chan<- error) {
 	file, err := os.Open(inputFile)
 	if err != nil {
-		return nil, err
+		errChan <- err
+		return
 	}
 	defer file.Close()
 
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
-		line := scanner.Text()
-		a := strings.Split(line, ",")
-		if len(a) != 2 {
-			return nil, fmt.Errorf("入力ファイルの形式エラー。入力ファイルはカンマ区切り2列を想定。line=%s", line)
-		}
-		for _, g := range gaijiList {
-			if strings.Contains(a[1], string(g.moji)) {
-				results = append(results, Result{moji: g.moji, key: a[0], value: a[1]})
-			}
-		}
+		jobChan <- scanner.Text()
 	}
 
 	if err := scanner.Err(); err != nil {
-		return nil, err
+		errChan <- err
+		return
 	}
 
-	slog.Info(fmt.Sprintf("入力ファイルから対象データを抽出しました。(抽出件数=%d)", len(results)))
-
-	return results, nil
+	// slog.Info(fmt.Sprintf("入力ファイルから対象データを抽出しました。(抽出件数=%d)", len(results)))
 }
 
 // 出力ファイルに書き出す
-func writeOutputFile(outputFilePath string, resultChan <-chan Result) error {
+func writeOutputFile(outputFilePath string, resultChan <-chan Result, errChan chan<- error) {
 	// 出力ファイルを開く
 	outputFile, err := os.Create(outputFilePath)
 	if err != nil {
-		return err
+		errChan <- err
+		return
 	}
 	defer outputFile.Close()
 
@@ -183,16 +175,20 @@ func writeOutputFile(outputFilePath string, resultChan <-chan Result) error {
 	defer writer.Flush()
 
 	// ヘッダーを書き込む
-	writer.Write([]string{"コード", "文字", "キー", "値"})
+	if err := writer.Write([]string{"コード", "文字", "キー", "値"}); err != nil {
+		errChan <- err
+		return
+	}
 
 	// ログエントリを書き込む
 	for r := range resultChan {
 		if err := writer.Write([]string{fmt.Sprintf("%X", r.moji), string(r.moji), r.key, r.value}); err != nil {
-			return err
+			errChan <- err
+			return
 		}
 	}
 
-	return nil
+	return
 }
 
 // ワーカー関数
