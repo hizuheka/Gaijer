@@ -15,18 +15,13 @@ import (
 	"github.com/google/subcommands"
 )
 
-type Result struct {
-	moji      rune
-	codepoint string
-	key       string
-	value     string
-}
-
 type findCmd struct {
 	input       string
 	output      string
 	gaiji       string
 	workerCount int
+	header      bool
+	value       bool
 }
 
 func (*findCmd) Name() string { return "find" }
@@ -34,7 +29,7 @@ func (*findCmd) Synopsis() string {
 	return "input ファイルから gaiji ファイルの外字を検索し、該当するデータを output ファイルに出力する"
 }
 func (*findCmd) Usage() string {
-	return `find -i 検索対象ファイル -o 検索結果ファイル -g 外字リストファイル [-w 並行処理数]:
+	return `find -i 検索対象ファイル -o 検索結果ファイル -g 外字リストファイル [-w 並行処理数] [-header] [-value]:
 	検索対象ファイルから外字リストファイルに定義されている外字を検索し、該当する行を検索結果ファイルに出力する。
 `
 }
@@ -44,6 +39,8 @@ func (p *findCmd) SetFlags(f *flag.FlagSet) {
 	f.StringVar(&p.output, "o", "", "検索結果ファイルのパス")
 	f.StringVar(&p.gaiji, "g", "", "外字リストファイルのパス")
 	f.IntVar(&p.workerCount, "w", 1, "並行処理数")
+	f.BoolVar(&p.header, "header", false, "ヘッダの出力有無")
+	f.BoolVar(&p.value, "value", false, "値の出力有無")
 }
 
 func (p *findCmd) validate() error {
@@ -69,7 +66,7 @@ func (p *findCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...any) subcomma
 		if err != nil {
 			slog.Error(err.Error())
 		}
-		slog.Info("END   find-Command")
+		slog.Info("END find-Command")
 	}()
 
 	slog.Info("START find-Command")
@@ -87,15 +84,17 @@ func (p *findCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...any) subcomma
 	}
 
 	// タスク準備
-	// - `numJobs` で指定した数だけのタスクを処理するため、ジョブキュー (`jobs`)と結果を格納するチャネル(`results`)を準備する
-	// - タスクの数に合わせてバッファサイズを設定する
+	// - ジョブキューを管理するチャネル (`jobChan`)を準備する。バッファは適当・・・
+	// - 結果を格納するチャネル(`resultChan`)を準備する。バッファは適当・・・
+	// - 発生したエラーを確認するためのチャネル(`errChan`)を準備する
 	jobChan := make(chan string, p.workerCount*100)
 	resultChan := make(chan Result, p.workerCount*10)
 	errChan := make(chan error, p.workerCount)
 
 	// ワーカープール作成
-	// - `numWorkers` で指定した数のワーカーを生成する。各ワーカーは`worker`関数を実行するゴルーチンとして起動される
-	// - 各ワーカーには一意のID(i)を与え、`jobs`チャネルからタスクを受け取って処理し、その結果を`results`チャネルに送信する
+	// - `p.workerCount` で指定した数のワーカーを生成する。各ワーカーは`worker`関数を実行するゴルーチンとして起動される
+	// - 各ワーカーには一意のID(i)を与え、`jobChan`チャネルからタスクを受け取って処理し、その結果を`resultChan`チャネルに送信する
+	// - ワーカーでエラーが発生した場合は、`errChan`チャネルに送信する
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -112,8 +111,9 @@ func (p *findCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...any) subcomma
 	}
 
 	// タスク割り当て
-	// - タスク(1からnumJobsまでの数値)をjobsチャネルに送信し、ワーカーに処理させる
-	// - 全てのタスクが`jobs`チャネルに送信された後、`close(jobs)`によりチャネルをクローズする。これにより、追加のタスクがないことがワーカーに通知される
+	// - `p.input`ファイルを読み込み、`jobChan`チャネルに送信し、ワーカーに処理させる
+	// - `p.input`の全ての行が`jobChan`チャネルに送信された後、`close(jobChan)`によりチャネルをクローズする。
+	// - これにより、追加のタスクがないことがワーカーに通知される
 	go func() {
 		defer close(jobChan)
 		if err := createJobs(ctx, p.input, jobChan); err != nil {
@@ -123,6 +123,9 @@ func (p *findCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...any) subcomma
 	}()
 
 	// 結果の集約
+	// - `resultChan`チャネルがcloseするまで受信し、`results`に追加する
+	// - `resultChan`チャネルからの受信後は、`close(done)`によりチャネルをクローズする
+	// - これにより、結果の集約が完了したことを通知する
 	done := make(chan struct{})
 	var results []Result
 	go func() {
@@ -131,8 +134,10 @@ func (p *findCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...any) subcomma
 	}()
 
 	// ワーカー完了待機
-	// - `sync.WaitGroup`を使用して、全てのワーカーの処理が完了するの待ちます。各ワーカーが完了すると`wg.Done`が呼び出され、全てのワーカーが完了すると待機が解除される
-	// - 全てのワーカーが完了し、全てのタスクの処理が終わった後、`results`チャネルをクローズする
+	// - `sync.WaitGroup`を使用して、全てのワーカーの処理が完了するの待つ
+	// - 各ワーカーが完了すると`wg.Done`が呼び出され、全てのワーカーが完了すると待機が解除される
+	// - 全てのワーカーが完了し、全てのタスクの処理が終わった後、`resultChan`チャネルと`errChan`チャネルをクローズする
+	// - `resultChan`チャネルをクローズすることで、結果の集約処理が終了する。
 	go func() {
 		slog.Debug("[wg.Wait] START")
 		wg.Wait()
@@ -142,25 +147,28 @@ func (p *findCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...any) subcomma
 	}()
 
 	// 完了確認
+	// - 結果の集約処理が完了すると、`close(done)`されるため、待機が解除される
 	<-done
 
 	// エラー確認
+	// goroutineでエラーが発生していなかを、`errChan`チャネルでチェックする
 	err = checkError(errChan)
 	if err != nil {
 		return subcommands.ExitFailure
 	}
 
 	// 結果のソート
+	// - コードポイント(昇順) > 識別番号(昇順)
 	sort.Slice(results, func(i, j int) bool {
 		if results[i].codepoint == results[j].codepoint {
-			return results[i].key < results[j].key
+			return results[i].id < results[j].id
 		}
 		return results[i].codepoint < results[j].codepoint
 	})
 
 	// 結果の出力
-	// - `results`チャネルからタスクの処理結果を受け取り、出力する。
-	err = writeOutputFile(p.output, results)
+	// - `result`の内容を`p.output`に出力する。
+	err = writeOutputFile(p.output, results, p.header, p.value)
 	if err != nil {
 		return subcommands.ExitFailure
 	}
@@ -168,7 +176,6 @@ func (p *findCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...any) subcomma
 	return subcommands.ExitSuccess
 }
 
-// func extractLinesWithGaiji(gaijiList []*gaiji, inputFile string) ([]Result, error) {
 func createJobs(ctx context.Context, inputFile string, jobChan chan<- string) error {
 	slog.Debug("[createJobs] START")
 	i := 0
@@ -203,7 +210,7 @@ func createJobs(ctx context.Context, inputFile string, jobChan chan<- string) er
 }
 
 // 出力ファイルに書き出す
-func writeOutputFile(outputFilePath string, results []Result) error {
+func writeOutputFile(outputFilePath string, results []Result, isOutputHeader bool, isOutputValue bool) error {
 	slog.Debug("[writeOutputFile] START")
 	i := 0
 	defer func() {
@@ -218,17 +225,19 @@ func writeOutputFile(outputFilePath string, results []Result) error {
 	defer outputFile.Close()
 
 	writer := csv.NewWriter(outputFile)
-	// writer.UserCRLF(true)
+	writer.UseCRLF = true
 	defer writer.Flush()
 
 	// ヘッダーを書き込む
-	if err := writer.Write([]string{"コード", "文字", "キー", "値"}); err != nil {
-		return err
+	if isOutputHeader {
+		if err := writer.Write(ResultHeaderAry()); err != nil {
+			return err
+		}
 	}
 
 	// ログエントリを書き込む
 	for _, r := range results {
-		if err := writer.Write([]string{r.codepoint, string(r.moji), r.key, r.value}); err != nil {
+		if err := writer.Write(r.Csv(isOutputValue)); err != nil {
 			return err
 		}
 		i++
@@ -256,13 +265,13 @@ func worker(ctx context.Context, id int, jobs <-chan string, results chan<- Resu
 			return ctx.Err()
 		default:
 			a := strings.Split(line, ",")
-			if len(a) != 2 {
+			if len(a) != 3 {
 				slog.Error(fmt.Sprintf("[worker] id=%d : ERROR!!", id))
-				return fmt.Errorf("入力ファイルの形式エラー。入力ファイルはカンマ区切り2列を想定。line=%s", line)
+				return fmt.Errorf("入力ファイルの形式エラー。入力ファイルはカンマ区切り3列を想定。line=%s", line)
 			}
 			for _, g := range gaijiList {
-				if strings.Contains(a[1], string(g.moji)) {
-					results <- Result{moji: g.moji, codepoint: g.codepoint, key: a[0], value: a[1]}
+				if strings.Contains(a[2], string(g.moji)) {
+					results <- Result{moji: g.moji, codepoint: g.codepoint, id: a[0], attr: a[1], value: a[2]}
 				}
 			}
 		}
