@@ -1,14 +1,15 @@
-package main
+package unlsql
 
 import (
-	"bufio"
 	"context"
 	"flag"
 	"fmt"
 	"log/slog"
-	"os"
 	"sort"
+	"strings"
 	"sync"
+
+	"Gaijer/cmd"
 
 	"github.com/google/subcommands"
 )
@@ -19,11 +20,9 @@ type job struct {
 	sql       string
 }
 
-type sqlCmd struct {
-	table       string
-	sel         string
-	where       string
-	orderby     string
+type UnlsqlCmd struct {
+	db          string
+	sql         string
 	output      string
 	gaiji       string
 	workerCount int
@@ -31,21 +30,19 @@ type sqlCmd struct {
 	value       bool
 }
 
-func (*sqlCmd) Name() string { return "sql" }
-func (*sqlCmd) Synopsis() string {
-	return "[table]テーブルから、[gaiji]ファイルと[select]と[where]により生成したSQLを基に抽出した結果を、[output]ファイルに出力する"
+func (*UnlsqlCmd) Name() string { return "sql" }
+func (*UnlsqlCmd) Synopsis() string {
+	return "[db]から、[gaiji]ファイルと[sql]基に抽出した結果を、[output]ファイルに出力する"
 }
-func (*sqlCmd) Usage() string {
-	return `sql -table 検索対象テーブル -select SELECT句 -where WHERE句 [-orderby ORDERBY句] -o 検索結果ファイル -g 外字リストファイル [-w 並行処理数] [-header] [-value]:
-	検索対象テーブルから、外字リストファイルとSELECT句、WHERE句、ORDERBY句から生成したSQLを基に抽出した結果を、検索結果ファイルに出力する
+func (*UnlsqlCmd) Usage() string {
+	return `unlsql -db DB -sql SQL -o 検索結果ファイル -g 外字リストファイル [-w 並行処理数] [-header] [-value]:
+	DBから、外字リストファイルとSQLを基に抽出した結果を、検索結果ファイルに出力する
 `
 }
 
-func (s *sqlCmd) SetFlags(f *flag.FlagSet) {
-	f.StringVar(&s.table, "table", "", "検索対象テーブル")
-	f.StringVar(&s.sel, "select", "", "SELECT句")
-	f.StringVar(&s.where, "where", "", "WHERE句")
-	f.StringVar(&s.orderby, "orderby", "", "ORDERBY句")
+func (s *UnlsqlCmd) SetFlags(f *flag.FlagSet) {
+	f.StringVar(&s.db, "db", "", "DB")
+	f.StringVar(&s.sql, "sql", "", "SQL")
 	f.StringVar(&s.output, "o", "", "検索結果ファイルのパス")
 	f.StringVar(&s.gaiji, "g", "", "外字リストファイルのパス")
 	f.IntVar(&s.workerCount, "w", 1, "並行処理数")
@@ -53,15 +50,15 @@ func (s *sqlCmd) SetFlags(f *flag.FlagSet) {
 	f.BoolVar(&s.value, "value", false, "値の出力有無")
 }
 
-func (s *sqlCmd) validate() error {
-	if s.table == "" {
-		return fmt.Errorf("引数 -table が指定されていません。")
+func (s *UnlsqlCmd) validate() error {
+	if s.db == "" {
+		return fmt.Errorf("引数 -db が指定されていません。")
 	}
-	if s.sel == "" {
-		return fmt.Errorf("引数 -select が指定されていません。")
+	if s.sql == "" {
+		return fmt.Errorf("引数 -sql が指定されていません。")
 	}
-	if s.where == "" {
-		return fmt.Errorf("引数 -where が指定されていません。")
+	if !strings.Contains(s.sql, "%s") {
+		return fmt.Errorf("引数 -sql には、外字文字置換箇所%sの指定が必要です。")
 	}
 	if s.output == "" {
 		return fmt.Errorf("引数 -o が指定されていません。")
@@ -76,7 +73,7 @@ func (s *sqlCmd) validate() error {
 	return nil
 }
 
-func (s *sqlCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...any) subcommands.ExitStatus {
+func (s *UnlsqlCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...any) subcommands.ExitStatus {
 	var err error
 	defer func() {
 		if err != nil {
@@ -93,8 +90,8 @@ func (s *sqlCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...any) subcomman
 	}
 
 	// 外字リストファイルを読み込み、外字リスト(gaiji構造体のスライス)を作成する
-	var gaijiList []*gaiji
-	gaijiList, err = createGaijiList(p.gaiji)
+	var gaijiList []*cmd.Gaiji
+	gaijiList, err = cmd.CreateGaijiList(s.gaiji)
 	if err != nil {
 		return subcommands.ExitFailure
 	}
@@ -104,7 +101,7 @@ func (s *sqlCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...any) subcomman
 	// - 結果を格納するチャネル(`resultChan`)を準備する。バッファは適当・・・
 	// - 発生したエラーを確認するためのチャネル(`errChan`)を準備する
 	jobChan := make(chan string, 3000)
-	resultChan := make(chan Result, s.workerCount*10)
+	resultChan := make(chan cmd.Result, s.workerCount*10)
 	errChan := make(chan error, s.workerCount)
 
 	// ワーカープール作成
@@ -143,7 +140,7 @@ func (s *sqlCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...any) subcomman
 	// - `resultChan`チャネルからの受信後は、`close(done)`によりチャネルをクローズする
 	// - これにより、結果の集約が完了したことを通知する
 	done := make(chan struct{})
-	var results []Result
+	var results []cmd.Result
 	go func() {
 		defer close(done)
 		results = collectResults(resultChan)
@@ -176,10 +173,10 @@ func (s *sqlCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...any) subcomman
 	// 結果のソート
 	// - コードポイント(昇順) > 識別番号(昇順)
 	sort.Slice(results, func(i, j int) bool {
-		if results[i].codepoint == results[j].codepoint {
-			return results[i].id < results[j].id
+		if results[i].Codepoint == results[j].Codepoint {
+			return results[i].Id < results[j].Id
 		}
-		return results[i].codepoint < results[j].codepoint
+		return results[i].Codepoint < results[j].Codepoint
 	})
 
 	// 結果の出力
@@ -192,34 +189,18 @@ func (s *sqlCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...any) subcomman
 	return subcommands.ExitSuccess
 }
 
-func createJobs(ctx context.Context, gaijiList []*gaiji, jobChan chan<- job) error {
+func createJobs(baseSql string, gaijiList []*cmd.Gaiji, jobChan chan<- job) error {
 	slog.Debug("[createJobs] START")
 	i := 0
 	defer func() {
 		slog.Info(fmt.Sprintf("[createJobs] END : 生成したジョブの数=%d", i))
 	}()
 
-	file, err := os.Open(inputFile)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		select {
-		case <-ctx.Done():
-			slog.Debug("[createJobs] canceled")
-			return nil
-		default:
-			jobChan <- scanner.Text()
-			i++
-			slog.Debug(fmt.Sprintf("[createJobs] add : job %d", i))
-		}
-	}
-
-	if err := scanner.Err(); err != nil {
-		return err
+	// s.sqlとgaijiListを基に抽出用SQLを生成し、jobChanに送信する
+	for _, g := range gaijiList {
+		jobChan <- job{moji: g.Moji, codepoint: g.Codepoint, sql: fmt.Sprintf(baseSql, g.Moji)}
+		i++
+		slog.Debug(fmt.Sprintf("[createJobs] add : job %d", i))
 	}
 
 	return nil

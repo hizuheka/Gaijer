@@ -1,4 +1,4 @@
-package main
+package find
 
 import (
 	"bufio"
@@ -12,10 +12,12 @@ import (
 	"strings"
 	"sync"
 
+	"Gaijer/cmd"
+
 	"github.com/google/subcommands"
 )
 
-type findCmd struct {
+type FindCmd struct {
 	input       string
 	output      string
 	gaiji       string
@@ -24,17 +26,17 @@ type findCmd struct {
 	value       bool
 }
 
-func (*findCmd) Name() string { return "find" }
-func (*findCmd) Synopsis() string {
+func (*FindCmd) Name() string { return "find" }
+func (*FindCmd) Synopsis() string {
 	return "input ファイルから gaiji ファイルの外字を検索し、該当するデータを output ファイルに出力する"
 }
-func (*findCmd) Usage() string {
+func (*FindCmd) Usage() string {
 	return `find -i 検索対象ファイル -o 検索結果ファイル -g 外字リストファイル [-w 並行処理数] [-header] [-value]:
 	検索対象ファイルから外字リストファイルに定義されている外字を検索し、該当する行を検索結果ファイルに出力する。
 `
 }
 
-func (p *findCmd) SetFlags(f *flag.FlagSet) {
+func (p *FindCmd) SetFlags(f *flag.FlagSet) {
 	f.StringVar(&p.input, "i", "", "検索対象ファイルのパス")
 	f.StringVar(&p.output, "o", "", "検索結果ファイルのパス")
 	f.StringVar(&p.gaiji, "g", "", "外字リストファイルのパス")
@@ -43,7 +45,7 @@ func (p *findCmd) SetFlags(f *flag.FlagSet) {
 	f.BoolVar(&p.value, "value", false, "値の出力有無")
 }
 
-func (p *findCmd) validate() error {
+func (p *FindCmd) validate() error {
 	if p.input == "" {
 		return fmt.Errorf("引数 -i が指定されていません。")
 	}
@@ -60,7 +62,7 @@ func (p *findCmd) validate() error {
 	return nil
 }
 
-func (p *findCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...any) subcommands.ExitStatus {
+func (p *FindCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...any) subcommands.ExitStatus {
 	var err error
 	defer func() {
 		if err != nil {
@@ -77,8 +79,8 @@ func (p *findCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...any) subcomma
 	}
 
 	// 外字リストファイルを読み込み、外字リスト(gaiji構造体のスライス)を作成する
-	var gaijiList []*gaiji
-	gaijiList, err = createGaijiList(p.gaiji)
+	var gaijiList []*cmd.Gaiji
+	gaijiList, err = cmd.CreateGaijiList(p.gaiji)
 	if err != nil {
 		return subcommands.ExitFailure
 	}
@@ -88,7 +90,7 @@ func (p *findCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...any) subcomma
 	// - 結果を格納するチャネル(`resultChan`)を準備する。バッファは適当・・・
 	// - 発生したエラーを確認するためのチャネル(`errChan`)を準備する
 	jobChan := make(chan string, p.workerCount*100)
-	resultChan := make(chan Result, p.workerCount*10)
+	resultChan := make(chan cmd.Result, p.workerCount*10)
 	errChan := make(chan error, p.workerCount)
 
 	// ワーカープール作成
@@ -127,7 +129,7 @@ func (p *findCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...any) subcomma
 	// - `resultChan`チャネルからの受信後は、`close(done)`によりチャネルをクローズする
 	// - これにより、結果の集約が完了したことを通知する
 	done := make(chan struct{})
-	var results []Result
+	var results []cmd.Result
 	go func() {
 		defer close(done)
 		results = collectResults(resultChan)
@@ -160,10 +162,10 @@ func (p *findCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...any) subcomma
 	// 結果のソート
 	// - コードポイント(昇順) > 識別番号(昇順)
 	sort.Slice(results, func(i, j int) bool {
-		if results[i].codepoint == results[j].codepoint {
-			return results[i].id < results[j].id
+		if results[i].Codepoint == results[j].Codepoint {
+			return results[i].Id < results[j].Id
 		}
-		return results[i].codepoint < results[j].codepoint
+		return results[i].Codepoint < results[j].Codepoint
 	})
 
 	// 結果の出力
@@ -210,7 +212,7 @@ func createJobs(ctx context.Context, inputFile string, jobChan chan<- string) er
 }
 
 // 出力ファイルに書き出す
-func writeOutputFile(outputFilePath string, results []Result, isOutputHeader bool, isOutputValue bool) error {
+func writeOutputFile(outputFilePath string, results []cmd.Result, isOutputHeader bool, isOutputValue bool) error {
 	slog.Debug("[writeOutputFile] START")
 	i := 0
 	defer func() {
@@ -230,7 +232,7 @@ func writeOutputFile(outputFilePath string, results []Result, isOutputHeader boo
 
 	// ヘッダーを書き込む
 	if isOutputHeader {
-		if err := writer.Write(ResultHeaderAry()); err != nil {
+		if err := writer.Write(cmd.ResultHeaderAry()); err != nil {
 			return err
 		}
 	}
@@ -249,7 +251,7 @@ func writeOutputFile(outputFilePath string, results []Result, isOutputHeader boo
 // ワーカー関数
 // - ワーカーが行うタスクの処理
 // - ジョブキュー(jobs)からタスクを受け取り、それを処理して、結果を結果チャネル(results)に送信する
-func worker(ctx context.Context, id int, jobs <-chan string, results chan<- Result, gaijiList []*gaiji) error {
+func worker(ctx context.Context, id int, jobs <-chan string, results chan<- cmd.Result, gaijiList []*cmd.Gaiji) error {
 	slog.Debug(fmt.Sprintf("[worker] id=%d : START", id))
 	defer func() {
 		slog.Debug(fmt.Sprintf("[worker] id=%d : END", id))
@@ -270,8 +272,8 @@ func worker(ctx context.Context, id int, jobs <-chan string, results chan<- Resu
 				return fmt.Errorf("入力ファイルの形式エラー。入力ファイルはカンマ区切り3列を想定。line=%s", line)
 			}
 			for _, g := range gaijiList {
-				if strings.Contains(a[2], string(g.moji)) {
-					results <- Result{moji: g.moji, codepoint: g.codepoint, id: a[0], attr: a[1], value: a[2]}
+				if strings.Contains(a[2], string(g.Moji)) {
+					results <- cmd.Result{Moji: g.Moji, Codepoint: g.Codepoint, Id: a[0], Attr: a[1], Value: a[2]}
 				}
 			}
 		}
@@ -280,10 +282,10 @@ func worker(ctx context.Context, id int, jobs <-chan string, results chan<- Resu
 	return nil
 }
 
-func collectResults(resultChan <-chan Result) []Result {
+func collectResults(resultChan <-chan cmd.Result) []cmd.Result {
 	slog.Debug("[collectResults] START")
 
-	var results []Result
+	var results []cmd.Result
 	i := 0
 	for r := range resultChan {
 		results = append(results, r)

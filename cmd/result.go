@@ -1,18 +1,18 @@
-package main
+package cmd
 
 type Result struct {
-	moji      rune
-	codepoint string
-	id        string
-	attr      string
-	value     string
+	Moji      rune
+	Codepoint string
+	Id        string
+	Attr      string
+	Value     string
 }
 
 func (r *Result) Csv(isOutputValue bool) []string {
 	if isOutputValue {
-		return []string{r.codepoint, string(r.moji), r.id, r.attr, r.value}
+		return []string{r.Codepoint, string(r.Moji), r.Id, r.Attr, r.Value}
 	} else {
-		return []string{r.codepoint, string(r.moji), r.id, r.attr}
+		return []string{r.Codepoint, string(r.Moji), r.Id, r.Attr}
 	}
 }
 

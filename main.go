@@ -10,6 +10,9 @@ import (
 	"log/slog"
 	"os"
 
+	"Gaijer/cmd/find"
+	unlsql "Gaijer/cmd/sql"
+
 	"github.com/google/subcommands"
 )
 
@@ -17,8 +20,8 @@ func main() {
 	subcommands.Register(subcommands.HelpCommand(), "")
 	subcommands.Register(subcommands.FlagsCommand(), "")
 	subcommands.Register(subcommands.CommandsCommand(), "")
-	subcommands.Register(&findCmd{}, "")
-	subcommands.Register(&sqlCmd{}, "")
+	subcommands.Register(&find.FindCmd{}, "")
+	subcommands.Register(&unlsql.UnlsqlCmd{}, "")
 
 	isDebug := flag.Bool("d", false, "debugログを出力")
 	flag.Parse()

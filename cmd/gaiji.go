@@ -1,4 +1,4 @@
-package main
+package cmd
 
 import (
 	"bufio"
@@ -11,18 +11,18 @@ import (
 )
 
 // * 調査対象の外字情報の構造体
-type gaiji struct {
-	moji      rune
-	codepoint string
+type Gaiji struct {
+	Moji      rune
+	Codepoint string
 }
 
 // * filename で指定されたファイルから、外字リストを作成する。
 // * filename には、UTF16BE、BOMなし、1行に外字1文字が出力されている。
-func createGaijiList(fileName string) ([]*gaiji, error) {
+func CreateGaijiList(fileName string) ([]*Gaiji, error) {
 	slog.Debug("[createGaijiList] START")
 	// ハッシュリストを定義
 	// gaijiList := make([]*gaiji, 2000)
-	var gaijiList []*gaiji
+	var gaijiList []*Gaiji
 
 	defer func() {
 		slog.Info(fmt.Sprintf("[createGaijiList] END : 外字リストの数=%d", len(gaijiList)))
@@ -42,7 +42,7 @@ func createGaijiList(fileName string) ([]*gaiji, error) {
 		// 一行ずつ取得。
 		r := []rune(scanner.Text())[0] // runeに変換。1文字目だけ取得
 		// ハッシュリストにセット
-		gaijiList = append(gaijiList, &gaiji{r, fmt.Sprintf("%X", r)})
+		gaijiList = append(gaijiList, &Gaiji{r, fmt.Sprintf("%X", r)})
 	}
 
 	// エラー処理
