@@ -1,15 +1,23 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"flag"
 	"fmt"
 	"log/slog"
+	"os"
 	"sort"
 	"sync"
 
 	"github.com/google/subcommands"
 )
+
+type job struct {
+	moji      rune
+	codepoint string
+	sql       string
+}
 
 type sqlCmd struct {
 	table       string
@@ -95,9 +103,9 @@ func (s *sqlCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...any) subcomman
 	// - ジョブキューを管理するチャネル (`jobChan`)を準備する。バッファは適当・・・
 	// - 結果を格納するチャネル(`resultChan`)を準備する。バッファは適当・・・
 	// - 発生したエラーを確認するためのチャネル(`errChan`)を準備する
-	jobChan := make(chan string, p.workerCount*100)
-	resultChan := make(chan Result, p.workerCount*10)
-	errChan := make(chan error, p.workerCount)
+	jobChan := make(chan string, 3000)
+	resultChan := make(chan Result, s.workerCount*10)
+	errChan := make(chan error, s.workerCount)
 
 	// ワーカープール作成
 	// - `p.workerCount` で指定した数のワーカーを生成する。各ワーカーは`worker`関数を実行するゴルーチンとして起動される
@@ -119,12 +127,12 @@ func (s *sqlCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...any) subcomman
 	}
 
 	// タスク割り当て
-	// - `p.input`ファイルを読み込み、`jobChan`チャネルに送信し、ワーカーに処理させる
-	// - `p.input`の全ての行が`jobChan`チャネルに送信された後、`close(jobChan)`によりチャネルをクローズする。
+	// - `gaijiList`を基に`job`を作成し、`jobChan`チャネルに送信し、ワーカーに処理させる
+	// - `gaijiList`の全てのデータが`jobChan`チャネルに送信された後、`close(jobChan)`によりチャネルをクローズする。
 	// - これにより、追加のタスクがないことがワーカーに通知される
 	go func() {
 		defer close(jobChan)
-		if err := createJobs(ctx, s.input, jobChan); err != nil {
+		if err := createJobs(ctx, gaijiList, jobChan); err != nil {
 			cancel()
 			errChan <- err
 		}
@@ -182,4 +190,37 @@ func (s *sqlCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...any) subcomman
 	}
 
 	return subcommands.ExitSuccess
+}
+
+func createJobs(ctx context.Context, gaijiList []*gaiji, jobChan chan<- job) error {
+	slog.Debug("[createJobs] START")
+	i := 0
+	defer func() {
+		slog.Info(fmt.Sprintf("[createJobs] END : 生成したジョブの数=%d", i))
+	}()
+
+	file, err := os.Open(inputFile)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		select {
+		case <-ctx.Done():
+			slog.Debug("[createJobs] canceled")
+			return nil
+		default:
+			jobChan <- scanner.Text()
+			i++
+			slog.Debug(fmt.Sprintf("[createJobs] add : job %d", i))
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return err
+	}
+
+	return nil
 }
