@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -27,6 +28,7 @@ type UnlsqlCmd struct {
 	sql         string
 	output      string
 	gaiji       string
+	tmpdir      string
 	workerCount int
 	header      bool
 	value       bool
@@ -37,7 +39,7 @@ func (*UnlsqlCmd) Synopsis() string {
 	return "[db]から、[gaiji]ファイルと[sql]基に抽出した結果を、[output]ファイルに出力する"
 }
 func (*UnlsqlCmd) Usage() string {
-	return `unlsql -db DB -sql SQL -o 検索結果ファイル -g 外字リストファイル [-w 並行処理数] [-header] [-value]:
+	return `unlsql -db DB -sql SQL -o 検索結果ファイル -g 外字リストファイル -tmpdir 作業フォルダ [-w 並行処理数] [-header] [-value]:
 	DBから、外字リストファイルとSQLを基に抽出した結果を、検索結果ファイルに出力する
 `
 }
@@ -47,6 +49,7 @@ func (s *UnlsqlCmd) SetFlags(f *flag.FlagSet) {
 	f.StringVar(&s.sql, "sql", "", "SQL")
 	f.StringVar(&s.output, "o", "", "検索結果ファイルのパス")
 	f.StringVar(&s.gaiji, "g", "", "外字リストファイルのパス")
+	f.StringVar(&s.tmpdir, "tmpdir", "", "作業フォルダのパス")
 	f.IntVar(&s.workerCount, "w", 1, "並行処理数")
 	f.BoolVar(&s.header, "header", false, "ヘッダの出力有無")
 	f.BoolVar(&s.value, "value", false, "値の出力有無")
@@ -67,6 +70,9 @@ func (s *UnlsqlCmd) validate() error {
 	}
 	if s.gaiji == "" {
 		return fmt.Errorf("引数 -g が指定されていません。")
+	}
+	if s.tmpdir == "" {
+		return fmt.Errorf("引数 -tmpdir が指定されていません。")
 	}
 	if s.workerCount <= 0 {
 		return fmt.Errorf("引数 -w には、1以上の整数を指定してください。(-w=%d)", s.workerCount)
@@ -218,7 +224,7 @@ func worker(ctx context.Context, id int, jobs <-chan job, results chan<- cmd.Res
 	}()
 
 	j := 0
-	for line := range jobs {
+	for job := range jobs {
 		j++
 		slog.Debug(fmt.Sprintf("[worker] id=%d : processing index=%d", id, j))
 		select {
@@ -226,16 +232,25 @@ func worker(ctx context.Context, id int, jobs <-chan job, results chan<- cmd.Res
 			slog.Debug(fmt.Sprintf("[worker] id=%d : canceled", id))
 			return ctx.Err()
 		default:
-			a := strings.Split(line, ",")
-			if len(a) != 3 {
-				slog.Error(fmt.Sprintf("[worker] id=%d : ERROR!!", id))
-				return fmt.Errorf("入力ファイルの形式エラー。入力ファイルはカンマ区切り3列を想定。line=%s", line)
-			}
-			for _, g := range gaijiList {
-				if strings.Contains(a[2], string(g.Moji)) {
-					results <- cmd.Result{Moji: g.Moji, Codepoint: g.Codepoint, Id: a[0], Attr: a[1], Value: a[2]}
-				}
-			}
+			// コマンド作成
+			// rdbunlsql -d [DB] -s [SQL] -t [out_file]
+			tpath := filepath.Join(j.tmpdir, job.codepoint&".txt")
+			cmdstr := fmt.Sprintf("rdbunlsql -d %s -s %s -t %s", s.db, job.sql, tpath)
+
+			// コマンド実行
+
+			// 抽出結果の取得
+
+			// a := strings.Split(line, ",")
+			// if len(a) != 3 {
+			// 	slog.Error(fmt.Sprintf("[worker] id=%d : ERROR!!", id))
+			// 	return fmt.Errorf("入力ファイルの形式エラー。入力ファイルはカンマ区切り3列を想定。line=%s", line)
+			// }
+			// for _, g := range gaijiList {
+			// 	if strings.Contains(a[2], string(g.Moji)) {
+			// 		results <- cmd.Result{Moji: g.Moji, Codepoint: g.Codepoint, Id: a[0], Attr: a[1], Value: a[2]}
+			// 	}
+			// }
 		}
 	}
 
