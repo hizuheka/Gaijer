@@ -1,10 +1,12 @@
 package unlsql
 
 import (
+	"bytes"
 	"context"
 	"flag"
 	"fmt"
 	"log/slog"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
@@ -20,7 +22,8 @@ import (
 type job struct {
 	moji      rune
 	codepoint string
-	sql       string
+	cmd       string
+	unload    string
 }
 
 type UnlsqlCmd struct {
@@ -63,7 +66,7 @@ func (s *UnlsqlCmd) validate() error {
 		return fmt.Errorf("引数 -sql が指定されていません。")
 	}
 	if !strings.Contains(s.sql, "%s") {
-		return fmt.Errorf("引数 -sql には、外字文字置換箇所%sの指定が必要です。")
+		return fmt.Errorf("引数 -sql には、外字文字置換箇所%sの指定が必要です。", "%s")
 	}
 	if s.output == "" {
 		return fmt.Errorf("引数 -o が指定されていません。")
@@ -137,7 +140,7 @@ func (s *UnlsqlCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...any) subcom
 	// - これにより、追加のタスクがないことがワーカーに通知される
 	go func() {
 		defer close(jobChan)
-		if err := createJobs(s.sql, gaijiList, jobChan); err != nil {
+		if err := createJobs(s.db, s.sql, s.tmpdir, gaijiList, jobChan); err != nil {
 			cancel()
 			errChan <- err
 		}
@@ -197,7 +200,7 @@ func (s *UnlsqlCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...any) subcom
 	return subcommands.ExitSuccess
 }
 
-func createJobs(baseSql string, gaijiList []*cmd.Gaiji, jobChan chan<- job) error {
+func createJobs(db string, baseSql string, tmpdir string, gaijiList []*cmd.Gaiji, jobChan chan<- job) error {
 	slog.Debug("[createJobs] START")
 	i := 0
 	defer func() {
@@ -206,7 +209,12 @@ func createJobs(baseSql string, gaijiList []*cmd.Gaiji, jobChan chan<- job) erro
 
 	// s.sqlとgaijiListを基に抽出用SQLを生成し、jobChanに送信する
 	for _, g := range gaijiList {
-		jobChan <- job{moji: g.Moji, codepoint: g.Codepoint, sql: fmt.Sprintf(baseSql, g.Moji)}
+		// コマンド作成
+		// rdbunlsql -d [DB] -s [SQL] -t [out_file]
+		unload := filepath.Join(tmpdir, g.Codepoint+".txt")
+		sql := fmt.Sprintf("\""+baseSql+"\"", string(g.Moji))
+		cmd := fmt.Sprintf("rdbunlsql -d %s -s %s -t %s", db, sql, unload)
+		jobChan <- job{moji: g.Moji, codepoint: g.Codepoint, cmd: cmd, unload: unload}
 		i++
 		slog.Debug(fmt.Sprintf("[createJobs] add : job %d", i))
 	}
@@ -233,11 +241,18 @@ func worker(ctx context.Context, id int, jobs <-chan job, results chan<- cmd.Res
 			return ctx.Err()
 		default:
 			// コマンド作成
-			// rdbunlsql -d [DB] -s [SQL] -t [out_file]
-			tpath := filepath.Join(j.tmpdir, job.codepoint&".txt")
-			cmdstr := fmt.Sprintf("rdbunlsql -d %s -s %s -t %s", s.db, job.sql, tpath)
+			// fmt.Println(job.cmd)
+
+			// アンロードファイルの削除(ファイルなしの場合もあるのでエラーは無視)
+			os.Remove(job.unload)
 
 			// コマンド実行
+			if st, eo, err := runCmdStr(job.cmd); err != nil {
+				return err
+			} else {
+				slog.Debug(fmt.Sprintf("[worker] id=%d : std-out=%s", id, st))
+				slog.Debug(fmt.Sprintf("[worker] id=%d : std-err=%s", id, eo))
+			}
 
 			// 抽出結果の取得
 
@@ -257,26 +272,36 @@ func worker(ctx context.Context, id int, jobs <-chan job, results chan<- cmd.Res
 	return nil
 }
 
-func runCmdStr(cmdstr string) error {
+func runCmdStr(cmdstr string) (string, string, error) {
+	var bufOut bytes.Buffer
+	var bufErr bytes.Buffer
+
 	// 文字列をコマンド、オプション単位でスライス化する
 	c, err := shellwords.Parse(cmdstr)
 	if err != nil {
-		return err
+		return "", "", err
 	}
 	switch len(c) {
 	case 0:
 		// 空の文字列が渡された場合
-		return nil
+		return "", "", nil
 	case 1:
 		// コマンドのみを渡された場合
-		err = exec.Command(c[0]).Run()
+		cmd := exec.Command(c[0])
+		cmd.Stdout = &bufOut
+		cmd.Stderr = &bufErr
+		err = cmd.Run()
 	default:
 		// コマンド+オプションを渡された場合
 		// オプションは可変長でexec.Commandに渡す
-		err = exec.Command(c[0], c[1:]...).Run()
+		cmd := exec.Command(c[0], c[1:]...)
+		cmd.Stdout = &bufOut
+		cmd.Stderr = &bufErr
+
+		err = cmd.Run()
 	}
 	if err != nil {
-		return err
+		return bufOut.String(), bufErr.String(), err
 	}
-	return nil
+	return bufOut.String(), bufErr.String(), nil
 }

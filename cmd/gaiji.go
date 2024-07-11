@@ -40,7 +40,11 @@ func CreateGaijiList(fileName string) ([]*Gaiji, error) {
 	scanner := bufio.NewScanner(reader)
 	for scanner.Scan() {
 		// 一行ずつ取得。
-		r := []rune(scanner.Text())[0] // runeに変換。1文字目だけ取得
+		line := scanner.Text()
+		if line == "" {
+			return nil, fmt.Errorf("空白行が存在します(file=%s)", fileName)
+		}
+		r := []rune(line)[0] // runeに変換。1文字目だけ取得
 		// ハッシュリストにセット
 		gaijiList = append(gaijiList, &Gaiji{r, fmt.Sprintf("%X", r)})
 	}

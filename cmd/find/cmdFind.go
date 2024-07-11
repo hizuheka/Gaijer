@@ -235,7 +235,13 @@ func worker(ctx context.Context, id int, jobs <-chan string, results chan<- cmd.
 			}
 			for _, g := range gaijiList {
 				if strings.Contains(a[2], string(g.Moji)) {
-					results <- cmd.Result{Moji: g.Moji, Codepoint: g.Codepoint, Id: a[0], Attr: a[1], Value: a[2]}
+					results <- cmd.Result{
+						Moji:      g.Moji,
+						Codepoint: g.Codepoint,
+						Id:        strings.Trim(a[0], "\""),
+						Attr:      strings.Trim(a[1], "\""),
+						Value:     strings.Trim(a[2], "\""),
+					}
 				}
 			}
 		}
