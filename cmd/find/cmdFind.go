@@ -3,7 +3,6 @@ package find
 import (
 	"bufio"
 	"context"
-	"encoding/csv"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -132,7 +131,7 @@ func (p *FindCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...any) subcomma
 	var results []cmd.Result
 	go func() {
 		defer close(done)
-		results = collectResults(resultChan)
+		results = cmd.CollectResults(resultChan)
 	}()
 
 	// ワーカー完了待機
@@ -154,7 +153,7 @@ func (p *FindCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...any) subcomma
 
 	// エラー確認
 	// goroutineでエラーが発生していなかを、`errChan`チャネルでチェックする
-	err = checkError(errChan)
+	err = cmd.CheckError(errChan)
 	if err != nil {
 		return subcommands.ExitFailure
 	}
@@ -170,7 +169,7 @@ func (p *FindCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...any) subcomma
 
 	// 結果の出力
 	// - `result`の内容を`p.output`に出力する。
-	err = writeOutputFile(p.output, results, p.header, p.value)
+	err = cmd.WriteOutputFile(p.output, results, p.header, p.value)
 	if err != nil {
 		return subcommands.ExitFailure
 	}
@@ -211,43 +210,6 @@ func createJobs(ctx context.Context, inputFile string, jobChan chan<- string) er
 	return nil
 }
 
-// 出力ファイルに書き出す
-func writeOutputFile(outputFilePath string, results []cmd.Result, isOutputHeader bool, isOutputValue bool) error {
-	slog.Debug("[writeOutputFile] START")
-	i := 0
-	defer func() {
-		slog.Info(fmt.Sprintf("[writeOutputFile] END : 出力した行数(ヘッダ除く)=%d", i))
-	}()
-
-	// 出力ファイルを開く
-	outputFile, err := os.Create(outputFilePath)
-	if err != nil {
-		return err
-	}
-	defer outputFile.Close()
-
-	writer := csv.NewWriter(outputFile)
-	writer.UseCRLF = true
-	defer writer.Flush()
-
-	// ヘッダーを書き込む
-	if isOutputHeader {
-		if err := writer.Write(cmd.ResultHeaderAry()); err != nil {
-			return err
-		}
-	}
-
-	// ログエントリを書き込む
-	for _, r := range results {
-		if err := writer.Write(r.Csv(isOutputValue)); err != nil {
-			return err
-		}
-		i++
-	}
-
-	return nil
-}
-
 // ワーカー関数
 // - ワーカーが行うタスクの処理
 // - ジョブキュー(jobs)からタスクを受け取り、それを処理して、結果を結果チャネル(results)に送信する
@@ -279,37 +241,5 @@ func worker(ctx context.Context, id int, jobs <-chan string, results chan<- cmd.
 		}
 	}
 
-	return nil
-}
-
-func collectResults(resultChan <-chan cmd.Result) []cmd.Result {
-	slog.Debug("[collectResults] START")
-
-	var results []cmd.Result
-	i := 0
-	for r := range resultChan {
-		results = append(results, r)
-		i++
-		slog.Debug(fmt.Sprintf("[collectResults] add index=%d", i))
-	}
-
-	slog.Debug("[collectResults] END")
-	return results
-}
-
-func checkError(errChan <-chan error) error {
-	slog.Debug("[error check] START")
-	select {
-	case e, ok := <-errChan:
-		if ok { // エラーを取得できた場合。closeされていた場合は、okはfalseになる
-			slog.Error("[error check] END : ERROR!!")
-			return e
-		}
-	default:
-		slog.Error("[error check] errChanがcloseされていません")
-		return fmt.Errorf("errChanがcloseされていません")
-	}
-
-	slog.Debug("[error check] END : NO ERROR")
 	return nil
 }

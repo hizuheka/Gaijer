@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"os/exec"
 	"sort"
 	"strings"
 	"sync"
@@ -12,6 +13,7 @@ import (
 	"Gaijer/cmd"
 
 	"github.com/google/subcommands"
+	"github.com/mattn/go-shellwords"
 )
 
 type job struct {
@@ -100,7 +102,7 @@ func (s *UnlsqlCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...any) subcom
 	// - ジョブキューを管理するチャネル (`jobChan`)を準備する。バッファは適当・・・
 	// - 結果を格納するチャネル(`resultChan`)を準備する。バッファは適当・・・
 	// - 発生したエラーを確認するためのチャネル(`errChan`)を準備する
-	jobChan := make(chan string, 3000)
+	jobChan := make(chan job, 3000)
 	resultChan := make(chan cmd.Result, s.workerCount*10)
 	errChan := make(chan error, s.workerCount)
 
@@ -124,12 +126,12 @@ func (s *UnlsqlCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...any) subcom
 	}
 
 	// タスク割り当て
-	// - `gaijiList`を基に`job`を作成し、`jobChan`チャネルに送信し、ワーカーに処理させる
+	// - `s.sql`と`gaijiList`を基に`job`を作成し、`jobChan`チャネルに送信し、ワーカーに処理させる
 	// - `gaijiList`の全てのデータが`jobChan`チャネルに送信された後、`close(jobChan)`によりチャネルをクローズする。
 	// - これにより、追加のタスクがないことがワーカーに通知される
 	go func() {
 		defer close(jobChan)
-		if err := createJobs(ctx, gaijiList, jobChan); err != nil {
+		if err := createJobs(s.sql, gaijiList, jobChan); err != nil {
 			cancel()
 			errChan <- err
 		}
@@ -143,7 +145,7 @@ func (s *UnlsqlCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...any) subcom
 	var results []cmd.Result
 	go func() {
 		defer close(done)
-		results = collectResults(resultChan)
+		results = cmd.CollectResults(resultChan)
 	}()
 
 	// ワーカー完了待機
@@ -165,7 +167,7 @@ func (s *UnlsqlCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...any) subcom
 
 	// エラー確認
 	// goroutineでエラーが発生していなかを、`errChan`チャネルでチェックする
-	err = checkError(errChan)
+	err = cmd.CheckError(errChan)
 	if err != nil {
 		return subcommands.ExitFailure
 	}
@@ -181,7 +183,7 @@ func (s *UnlsqlCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...any) subcom
 
 	// 結果の出力
 	// - `result`の内容を`p.output`に出力する。
-	err = writeOutputFile(p.output, results, p.header, p.value)
+	err = cmd.WriteOutputFile(s.output, results, s.header, s.value)
 	if err != nil {
 		return subcommands.ExitFailure
 	}
@@ -203,5 +205,63 @@ func createJobs(baseSql string, gaijiList []*cmd.Gaiji, jobChan chan<- job) erro
 		slog.Debug(fmt.Sprintf("[createJobs] add : job %d", i))
 	}
 
+	return nil
+}
+
+// ワーカー関数
+// - ワーカーが行うタスクの処理
+// - ジョブキュー(jobs)からタスクを受け取り、それを処理して、結果を結果チャネル(results)に送信する
+func worker(ctx context.Context, id int, jobs <-chan job, results chan<- cmd.Result) error {
+	slog.Debug(fmt.Sprintf("[worker] id=%d : START", id))
+	defer func() {
+		slog.Debug(fmt.Sprintf("[worker] id=%d : END", id))
+	}()
+
+	j := 0
+	for line := range jobs {
+		j++
+		slog.Debug(fmt.Sprintf("[worker] id=%d : processing index=%d", id, j))
+		select {
+		case <-ctx.Done():
+			slog.Debug(fmt.Sprintf("[worker] id=%d : canceled", id))
+			return ctx.Err()
+		default:
+			a := strings.Split(line, ",")
+			if len(a) != 3 {
+				slog.Error(fmt.Sprintf("[worker] id=%d : ERROR!!", id))
+				return fmt.Errorf("入力ファイルの形式エラー。入力ファイルはカンマ区切り3列を想定。line=%s", line)
+			}
+			for _, g := range gaijiList {
+				if strings.Contains(a[2], string(g.Moji)) {
+					results <- cmd.Result{Moji: g.Moji, Codepoint: g.Codepoint, Id: a[0], Attr: a[1], Value: a[2]}
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+func runCmdStr(cmdstr string) error {
+	// 文字列をコマンド、オプション単位でスライス化する
+	c, err := shellwords.Parse(cmdstr)
+	if err != nil {
+		return err
+	}
+	switch len(c) {
+	case 0:
+		// 空の文字列が渡された場合
+		return nil
+	case 1:
+		// コマンドのみを渡された場合
+		err = exec.Command(c[0]).Run()
+	default:
+		// コマンド+オプションを渡された場合
+		// オプションは可変長でexec.Commandに渡す
+		err = exec.Command(c[0], c[1:]...).Run()
+	}
+	if err != nil {
+		return err
+	}
 	return nil
 }
