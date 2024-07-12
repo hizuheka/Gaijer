@@ -4,8 +4,10 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -18,6 +20,8 @@ import (
 
 	"github.com/google/subcommands"
 	"github.com/mattn/go-shellwords"
+	"golang.org/x/text/encoding/japanese"
+	"golang.org/x/text/transform"
 )
 
 type job struct {
@@ -66,8 +70,8 @@ func (s *UnlsqlCmd) validate() error {
 	if s.sql == "" {
 		return fmt.Errorf("引数 -sql が指定されていません。")
 	}
-	if !strings.Contains(s.sql, "%s") {
-		return fmt.Errorf("引数 -sql には、外字文字置換箇所%sの指定が必要です。", "%s")
+	if !strings.Contains(s.sql, "@") {
+		return errors.New("引数 -sql には、外字文字置換箇所@の指定が必要です。")
 	}
 	if s.output == "" {
 		return fmt.Errorf("引数 -o が指定されていません。")
@@ -212,8 +216,8 @@ func createJobs(db string, baseSql string, tmpdir string, gaijiList []*cmd.Gaiji
 	for _, g := range gaijiList {
 		// コマンド作成
 		// rdbunlsql -d [DB] -s [SQL] -t [out_file]
-		unload := filepath.Join(tmpdir, g.Codepoint+".txt")
-		sql := fmt.Sprintf("\""+baseSql+"\"", string(g.Moji))
+		unload, _ := filepath.Abs(filepath.Join(tmpdir, g.Codepoint+".txt"))
+		sql := "\"" + strings.ReplaceAll(baseSql, "@", string(g.Moji)) + "\""
 		cmd := fmt.Sprintf("rdbunlsql -d %s -s %s -t %s", db, sql, unload)
 		jobChan <- job{moji: g.Moji, codepoint: g.Codepoint, cmd: cmd, unload: unload}
 		i++
@@ -302,27 +306,35 @@ func runCmdStr(cmdstr string) (string, string, error) {
 	if err != nil {
 		return "", "", err
 	}
+
+	var cmd *exec.Cmd
 	switch len(c) {
 	case 0:
 		// 空の文字列が渡された場合
 		return "", "", nil
 	case 1:
 		// コマンドのみを渡された場合
-		cmd := exec.Command(c[0])
-		cmd.Stdout = &bufOut
-		cmd.Stderr = &bufErr
-		err = cmd.Run()
+		cmd = exec.Command(c[0])
 	default:
 		// コマンド+オプションを渡された場合
 		// オプションは可変長でexec.Commandに渡す
-		cmd := exec.Command(c[0], c[1:]...)
-		cmd.Stdout = &bufOut
-		cmd.Stderr = &bufErr
+		cmd = exec.Command(c[0], c[1:]...)
+	}
 
-		err = cmd.Run()
-	}
+	cmd.Stdout = &bufOut
+	cmd.Stderr = &bufErr
+
+	err = cmd.Run()
+	bo, _ := sjisToUtf8(bufOut.String())
+	be, _ := sjisToUtf8(bufErr.String())
+	return bo, be, err
+}
+
+// ShiftJIS から UTF-8
+func sjisToUtf8(str string) (string, error) {
+	ret, err := io.ReadAll(transform.NewReader(strings.NewReader(str), japanese.ShiftJIS.NewDecoder()))
 	if err != nil {
-		return bufOut.String(), bufErr.String(), err
+		return "", err
 	}
-	return bufOut.String(), bufErr.String(), nil
+	return string(ret), err
 }
