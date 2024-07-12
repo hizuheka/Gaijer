@@ -1,6 +1,7 @@
 package unlsql
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"flag"
@@ -240,32 +241,50 @@ func worker(ctx context.Context, id int, jobs <-chan job, results chan<- cmd.Res
 			slog.Debug(fmt.Sprintf("[worker] id=%d : canceled", id))
 			return ctx.Err()
 		default:
-			// コマンド作成
-			// fmt.Println(job.cmd)
-
 			// アンロードファイルの削除(ファイルなしの場合もあるのでエラーは無視)
 			os.Remove(job.unload)
 
 			// コマンド実行
 			if st, eo, err := runCmdStr(job.cmd); err != nil {
+				slog.Error(fmt.Sprintf("[worker] id=%d : std-out=%s", id, st))
+				slog.Error(fmt.Sprintf("[worker] id=%d : std-err=%s", id, eo))
 				return err
 			} else {
 				slog.Debug(fmt.Sprintf("[worker] id=%d : std-out=%s", id, st))
 				slog.Debug(fmt.Sprintf("[worker] id=%d : std-err=%s", id, eo))
 			}
 
-			// 抽出結果の取得
+			// 抽出結果ファイルを開く
+			fp, err := os.Open(job.unload)
+			if err != nil {
+				return err
+			}
+			defer fp.Close()
 
-			// a := strings.Split(line, ",")
-			// if len(a) != 3 {
-			// 	slog.Error(fmt.Sprintf("[worker] id=%d : ERROR!!", id))
-			// 	return fmt.Errorf("入力ファイルの形式エラー。入力ファイルはカンマ区切り3列を想定。line=%s", line)
-			// }
-			// for _, g := range gaijiList {
-			// 	if strings.Contains(a[2], string(g.Moji)) {
-			// 		results <- cmd.Result{Moji: g.Moji, Codepoint: g.Codepoint, Id: a[0], Attr: a[1], Value: a[2]}
-			// 	}
-			// }
+			// 抽出結果ファイルを読み込む。BOMが付いていた場合も考慮。
+			reader := bufio.NewReader(fp)
+			scanner := bufio.NewScanner(reader)
+			for scanner.Scan() {
+				// 一行ずつ取得。
+				line := scanner.Text()
+				a := strings.Split(line, ",")
+				if len(a) < 3 {
+					return fmt.Errorf("抽出結果は3列以上のデータが必要です(line=%s)", line)
+				}
+				v := strings.ReplaceAll(strings.Join(a[2:], " | "), "\"", "")
+				results <- cmd.Result{
+					Moji:      job.moji,
+					Codepoint: job.codepoint,
+					Id:        strings.Trim(a[0], "\""),
+					Attr:      strings.Trim(a[1], "\""),
+					Value:     v,
+				}
+			}
+
+			// エラー処理
+			if err := scanner.Err(); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -275,6 +294,8 @@ func worker(ctx context.Context, id int, jobs <-chan job, results chan<- cmd.Res
 func runCmdStr(cmdstr string) (string, string, error) {
 	var bufOut bytes.Buffer
 	var bufErr bytes.Buffer
+
+	slog.Debug(fmt.Sprintf("[runCmdStr] cmd=%s", cmdstr))
 
 	// 文字列をコマンド、オプション単位でスライス化する
 	c, err := shellwords.Parse(cmdstr)
