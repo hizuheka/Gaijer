@@ -166,6 +166,7 @@ func (p *FindCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...any) subcomma
 		}
 		return results[i].Codepoint < results[j].Codepoint
 	})
+	slog.Info(fmt.Sprintf("[Execute] END sort.Slice : 抽出結果=%d", len(results)))
 
 	// 結果の出力
 	// - `result`の内容を`p.output`に出力する。
@@ -181,6 +182,7 @@ func createJobs(ctx context.Context, inputFile string, jobChan chan<- string) er
 	slog.Debug("[createJobs] START")
 	i := 0
 	defer func() {
+		fmt.Println()
 		slog.Info(fmt.Sprintf("[createJobs] END : 生成したジョブの数=%d", i))
 	}()
 
@@ -190,6 +192,15 @@ func createJobs(ctx context.Context, inputFile string, jobChan chan<- string) er
 	}
 	defer file.Close()
 
+	// ファイルサイズを取得
+	fs, err := file.Stat()
+	if err != nil {
+		return err
+	}
+	filesize := fs.Size()
+	var readsize int64 // 読み込んだサイズ
+	progressRate := 0  // 進捗率
+
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		select {
@@ -198,6 +209,13 @@ func createJobs(ctx context.Context, inputFile string, jobChan chan<- string) er
 			return nil
 		default:
 			jobChan <- scanner.Text()
+			readsize = readsize + int64(len(scanner.Bytes())) + 1 // +1 は改行コード分
+			pr := int((float64(readsize) / float64(filesize)) * 100)
+			// 進捗率(整数)が変化した場合のみ、コンソールに表示
+			if progressRate != pr {
+				progressRate = pr
+				fmt.Fprintf(os.Stderr, "\r入力ファイル読込状況： %d %%", progressRate)
+			}
 			i++
 			slog.Debug(fmt.Sprintf("[createJobs] add : job %d", i))
 		}
