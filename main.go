@@ -8,6 +8,7 @@ import (
 	"os"
 
 	"Gaijer/cmd/find"
+	"Gaijer/cmd/search"
 
 	"github.com/google/subcommands"
 )
@@ -19,6 +20,7 @@ func main() {
 	subcommands.Register(subcommands.FlagsCommand(), "")
 	subcommands.Register(subcommands.CommandsCommand(), "")
 	subcommands.Register(&find.FindCmd{}, "")
+	subcommands.Register(&search.SearchCmd{}, "")
 
 	isDebug := flag.Bool("d", false, "debugログを出力")
 	isVersion := flag.Bool("v", false, "バージョンを出力")
