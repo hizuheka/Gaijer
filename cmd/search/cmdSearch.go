@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -187,7 +188,10 @@ func (p *SearchCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...any) subcom
 		// - コードポイント(昇順) > 識別番号(昇順)
 		sort.Slice(results, func(i, j int) bool {
 			if results[i].Codepoint == results[j].Codepoint {
-				return results[i].Id < results[j].Id
+				// 識別番号には「行数」を格納するため、数字として比較する
+				iVal, _ := strconv.Atoi(results[i].Id)
+				jVal, _ := strconv.Atoi(results[j].Id)
+				return iVal < jVal
 			}
 			return results[i].Codepoint < results[j].Codepoint
 		})
@@ -239,7 +243,7 @@ func createJobs(ctx context.Context, inputFile string, jobChan chan<- string) er
 			slog.Debug("[createJobs] canceled")
 			return nil
 		default:
-			jobChan <- scanner.Text()
+			jobChan <- strconv.Itoa(i) + "," + scanner.Text()
 			readsize = readsize + int64(len(scanner.Bytes())) + 1 // +1 は改行コード分
 			pr := int((float64(readsize) / float64(filesize)) * 100)
 			// 進捗率(整数)が変化した場合のみ、コンソールに表示
@@ -278,18 +282,18 @@ func worker(ctx context.Context, id int, jobs <-chan string, results chan<- cmd.
 			return ctx.Err()
 		default:
 			a := strings.Split(line, ",")
-			if len(a) != 3 {
+			if len(a) != 2 {
 				slog.Error(fmt.Sprintf("[worker] id=%d : ERROR!!", id))
 				return fmt.Errorf("入力ファイルの形式エラー。入力ファイルはカンマ区切り3列を想定。line=%s", line)
 			}
 			for _, g := range gaijiList {
-				if strings.Contains(a[2], string(g.Moji)) {
+				if strings.Contains(a[1], string(g.Moji)) {
 					results <- cmd.Result{
 						Moji:      g.Moji,
 						Codepoint: g.Codepoint,
 						Id:        strings.Trim(a[0], "\""),
-						Attr:      strings.Trim(a[1], "\""),
-						Value:     strings.Trim(a[2], "\""),
+						// Attr:      strings.Trim(a[1], "\""),
+						Value: strings.Trim(a[1], "\""),
 					}
 				}
 			}
