@@ -18,6 +18,12 @@ import (
 	"github.com/google/subcommands"
 )
 
+// Job はワーカーが処理するタスクを表します。
+type Job struct {
+	LineNumber int
+	Text       string
+}
+
 type SearchCmd struct {
 	inputFolder  string
 	outputFolder string
@@ -80,10 +86,16 @@ func (p *SearchCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...any) subcom
 	}
 
 	// 外字リストファイルを読み込み、外字リスト(gaiji構造体のスライス)を作成する
-	var gaijiList []*cmd.Gaiji
-	gaijiList, err = cmd.CreateGaijiList(p.gaiji)
+	gaijiList, err := cmd.CreateGaijiList(p.gaiji)
 	if err != nil {
+		slog.Error("外字リストファイルの読み込みに失敗しました。", "path", p.gaiji, "error", err)
 		return subcommands.ExitFailure
+	}
+
+	// 検索を高速化するため、rune をキーとするマップに変換
+	gaijiMap := make(map[rune]*cmd.Gaiji, len(gaijiList))
+	for _, g := range gaijiList {
+		gaijiMap[g.Moji] = g
 	}
 
 	// 入力フォルダ内のファイルをすべて取得
@@ -113,7 +125,7 @@ func (p *SearchCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...any) subcom
 		// - ジョブキューを管理するチャネル (`jobChan`)を準備する。バッファは適当・・・
 		// - 結果を格納するチャネル(`resultChan`)を準備する。バッファは適当・・・
 		// - 発生したエラーを確認するためのチャネル(`errChan`)を準備する
-		jobChan := make(chan string, p.workerCount*100)
+		jobChan := make(chan Job, p.workerCount*100)
 		resultChan := make(chan cmd.Result, p.workerCount*10)
 		errChan := make(chan error, p.workerCount)
 
@@ -129,7 +141,7 @@ func (p *SearchCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...any) subcom
 			wg.Add(1)
 			go func(i int) {
 				defer wg.Done()
-				if err := worker(ctx, i, jobChan, resultChan, gaijiList); err != nil {
+				if err := worker(ctx, i, jobChan, resultChan, gaijiMap); err != nil {
 					cancel()
 					errChan <- err
 				}
@@ -213,12 +225,13 @@ func (p *SearchCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...any) subcom
 	return subcommands.ExitSuccess
 }
 
-func createJobs(ctx context.Context, inputFile string, jobChan chan<- string) error {
+// createJobs は入力ファイルを読み込み、ジョブチャネルにタスクを送信します。
+func createJobs(ctx context.Context, inputFile string, jobChan chan<- Job) error {
 	slog.Debug("[createJobs] START")
-	i := 0
+	lineNumber := 0
 	defer func() {
 		fmt.Println()
-		slog.Info(fmt.Sprintf("[createJobs] END : 生成したジョブの数=%d", i))
+		slog.Info("[createJobs] ジョブの生成が完了しました。", "total_jobs", lineNumber)
 	}()
 
 	file, err := os.Open(inputFile)
@@ -238,12 +251,13 @@ func createJobs(ctx context.Context, inputFile string, jobChan chan<- string) er
 
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
+		lineNumber++
 		select {
 		case <-ctx.Done():
-			slog.Debug("[createJobs] canceled")
+			slog.Info("[createJobs] ジョブ生成がキャンセルされました。")
 			return nil
-		default:
-			jobChan <- strconv.Itoa(i) + "," + scanner.Text()
+			// default:
+		case jobChan <- Job{LineNumber: lineNumber, Text: scanner.Text()}:
 			readsize = readsize + int64(len(scanner.Bytes())) + 1 // +1 は改行コード分
 			pr := int((float64(readsize) / float64(filesize)) * 100)
 			// 進捗率(整数)が変化した場合のみ、コンソールに表示
@@ -251,8 +265,7 @@ func createJobs(ctx context.Context, inputFile string, jobChan chan<- string) er
 				progressRate = pr
 				fmt.Fprintf(os.Stderr, "\r入力ファイル読込状況： %d %%", progressRate)
 			}
-			i++
-			slog.Debug(fmt.Sprintf("[createJobs] add : job %d", i))
+			slog.Debug("[createJobs] ジョブを追加しました。", "add_job", lineNumber)
 		}
 	}
 
@@ -266,34 +279,33 @@ func createJobs(ctx context.Context, inputFile string, jobChan chan<- string) er
 // ワーカー関数
 // - ワーカーが行うタスクの処理
 // - ジョブキュー(jobs)からタスクを受け取り、それを処理して、結果を結果チャネル(results)に送信する
-func worker(ctx context.Context, id int, jobs <-chan string, results chan<- cmd.Result, gaijiList []*cmd.Gaiji) error {
+func worker(ctx context.Context, id int, jobs <-chan Job, results chan<- cmd.Result, gaijiMap map[rune]*cmd.Gaiji) error {
 	slog.Debug(fmt.Sprintf("[worker] id=%d : START", id))
 	defer func() {
 		slog.Debug(fmt.Sprintf("[worker] id=%d : END", id))
 	}()
 
 	j := 0
-	for line := range jobs {
+	for job := range jobs {
 		j++
 		slog.Debug(fmt.Sprintf("[worker] id=%d : processing index=%d", id, j))
 		select {
 		case <-ctx.Done():
-			slog.Debug(fmt.Sprintf("[worker] id=%d : canceled", id))
+			slog.Info("[worker] ワーカー処理がキャンセルされました。", "id", id)
 			return ctx.Err()
 		default:
-			a := strings.Split(line, ",")
-			if len(a) != 2 {
-				slog.Error(fmt.Sprintf("[worker] id=%d : ERROR!!", id))
-				return fmt.Errorf("入力ファイルの形式エラー。入力ファイルはカンマ区切り3列を想定。line=%s", line)
-			}
-			for _, g := range gaijiList {
-				if strings.Contains(a[1], string(g.Moji)) {
-					results <- cmd.Result{
-						Moji:      g.Moji,
-						Codepoint: g.Codepoint,
-						Id:        strings.Trim(a[0], "\""),
-						// Attr:      strings.Trim(a[1], "\""),
-						Value: strings.Trim(a[1], "\""),
+			// 1行内で同じ外字を重複して報告しないためのセット
+			foundGaiji := make(map[rune]struct{})
+			for _, char := range job.Text {
+				if g, ok := gaijiMap[char]; ok {
+					if _, found := foundGaiji[char]; !found {
+						results <- cmd.Result{
+							Moji:      g.Moji,
+							Codepoint: g.Codepoint,
+							Id:        strconv.Itoa(job.LineNumber),
+							Value:     strings.Trim(job.Text, "\""),
+						}
+						foundGaiji[char] = struct{}{}
 					}
 				}
 			}
