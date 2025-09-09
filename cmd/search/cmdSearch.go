@@ -69,45 +69,40 @@ func (p *SearchCmd) validate() error {
 	return nil
 }
 
-func (p *SearchCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...any) subcommands.ExitStatus {
-	var err error
+func (c *SearchCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...any) subcommands.ExitStatus {
+	slog.Info("searchコマンドを開始します。")
+	var finalErr error
 	defer func() {
-		if err != nil {
-			slog.Error(err.Error())
+		if finalErr != nil {
+			slog.Error("コマンドの実行中にエラーが発生しました。", "error", finalErr)
 		}
-		slog.Info("END search-Command")
+		slog.Info("searchコマンドを終了します。")
 	}()
 
-	slog.Info("START search-Command")
-
 	// 起動時引数のチェック
-	if err = p.validate(); err != nil {
+	if err := c.validate(); err != nil {
+		finalErr = err
 		return subcommands.ExitUsageError
 	}
 
-	// 外字リストファイルを読み込み、外字リスト(gaiji構造体のスライス)を作成する
-	gaijiList, err := cmd.CreateGaijiList(p.gaiji)
+	// 外字リストを読み込み、検索を高速化するためruneをキーとするマップに変換します。
+	gaijiMap, err := c.createGaijiMap()
 	if err != nil {
-		slog.Error("外字リストファイルの読み込みに失敗しました。", "path", p.gaiji, "error", err)
+		finalErr = err
 		return subcommands.ExitFailure
 	}
 
-	// 検索を高速化するため、rune をキーとするマップに変換
-	gaijiMap := make(map[rune]*cmd.Gaiji, len(gaijiList))
-	for _, g := range gaijiList {
-		gaijiMap[g.Moji] = g
-	}
-
-	// 入力フォルダ内のファイルをすべて取得
-	files, err := os.ReadDir(p.inputFolder)
+	// 入力フォルダ内のファイルリストを取得します。
+	files, err := os.ReadDir(c.inputFolder)
 	if err != nil {
-		slog.Error(fmt.Sprintf("入力フォルダの読み取りに失敗しました: %v", err))
+		finalErr = fmt.Errorf("入力フォルダの読み取りに失敗しました: %w", err)
 		return subcommands.ExitFailure
 	}
 
-	// 出力フォルダが存在しない場合は作成
-	if err := os.MkdirAll(p.outputFolder, os.ModePerm); err != nil {
-		slog.Error(fmt.Sprintf("出力フォルダの作成に失敗しました: %v", err))
+	// 出力フォルダが存在しない場合は作成します。
+	// os.ModePerm (0777) は過剰な権限のため、より安全な 0755 を使用します。
+	if err := os.MkdirAll(c.outputFolder, 0755); err != nil {
+		finalErr = fmt.Errorf("出力フォルダの作成に失敗しました: %w", err)
 		return subcommands.ExitFailure
 	}
 
@@ -117,112 +112,148 @@ func (p *SearchCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...any) subcom
 			continue
 		}
 
-		inputFile := filepath.Join(p.inputFolder, file.Name())
-		outputFile := filepath.Join(p.outputFolder, file.Name()+".out")
-		slog.Info(fmt.Sprintf("処理開始: %s", inputFile))
+		inputFile := filepath.Join(c.inputFolder, file.Name())
+		outputFile := filepath.Join(c.outputFolder, file.Name()+".out")
 
-		// タスク準備
-		// - ジョブキューを管理するチャネル (`jobChan`)を準備する。バッファは適当・・・
-		// - 結果を格納するチャネル(`resultChan`)を準備する。バッファは適当・・・
-		// - 発生したエラーを確認するためのチャネル(`errChan`)を準備する
-		jobChan := make(chan Job, p.workerCount*100)
-		resultChan := make(chan cmd.Result, p.workerCount*10)
-		errChan := make(chan error, p.workerCount)
-
-		// ワーカープール作成
-		// - `p.workerCount` で指定した数のワーカーを生成する。各ワーカーは`worker`関数を実行するゴルーチンとして起動される
-		// - 各ワーカーには一意のID(i)を与え、`jobChan`チャネルからタスクを受け取って処理し、その結果を`resultChan`チャネルに送信する
-		// - ワーカーでエラーが発生した場合は、`errChan`チャネルに送信する
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-
-		var wg sync.WaitGroup
-		for i := 1; i <= p.workerCount; i++ {
-			wg.Add(1)
-			go func(i int) {
-				defer wg.Done()
-				if err := worker(ctx, i, jobChan, resultChan, gaijiMap); err != nil {
-					cancel()
-					errChan <- err
-				}
-			}(i)
+		slog.Info("ファイルの処理を開始します。", "input", inputFile)
+		if err := c.processFile(inputFile, outputFile, gaijiMap); err != nil {
+			// 一つのファイルでエラーが発生しても処理を止めず、次のファイルに進みます。
+			// エラーはログに出力します。
+			slog.Error("ファイルの処理に失敗しました。", "file", inputFile, "error", err)
+			finalErr = err // 最終的なエラーとして記憶
+		} else {
+			slog.Info("ファイルの処理が完了しました。", "output", outputFile)
 		}
+	}
 
-		// タスク割り当て
-		// - `p.input`ファイルを読み込み、`jobChan`チャネルに送信し、ワーカーに処理させる
-		// - `p.input`の全ての行が`jobChan`チャネルに送信された後、`close(jobChan)`によりチャネルをクローズする。
-		// - これにより、追加のタスクがないことがワーカーに通知される
-		go func() {
-			defer close(jobChan)
-			if err := createJobs(ctx, inputFile, jobChan); err != nil {
+	if finalErr != nil {
+		return subcommands.ExitFailure
+	}
+	return subcommands.ExitSuccess
+}
+
+// createGaijiMap は外字リストファイルを読み込み、検索用のマップを作成します。
+func (c *SearchCmd) createGaijiMap() (map[rune]*cmd.Gaiji, error) {
+	gaijiList, err := cmd.CreateGaijiList(c.gaiji)
+	if err != nil {
+		return nil, fmt.Errorf("外字リストファイルの読み込みに失敗しました (%s): %w", c.gaiji, err)
+	}
+
+	gaijiMap := make(map[rune]*cmd.Gaiji, len(gaijiList))
+	for _, g := range gaijiList {
+		gaijiMap[g.Moji] = g
+	}
+	return gaijiMap, nil
+}
+
+// processFile は単一のファイルに対する検索処理全体を管理します。
+func (c *SearchCmd) processFile(inputFile, outputFile string, gaijiMap map[rune]*cmd.Gaiji) error {
+	ctx, cancel := context.WithCancel(context.Background())
+	// deferではなく、関数の最後に明示的にcancel()を呼び出すことで、意図を明確にします。
+	defer cancel()
+
+	// タスク準備
+	// - ジョブキューを管理するチャネル (`jobChan`)を準備する。バッファは適当・・・
+	// - 結果を格納するチャネル(`resultChan`)を準備する。バッファは適当・・・
+	// - 発生したエラーを確認するためのチャネル(`errChan`)を準備する
+	jobChan := make(chan Job, c.workerCount*100)
+	resultChan := make(chan cmd.Result, c.workerCount*10)
+	errChan := make(chan error, c.workerCount+1) // ジョブ生成元とワーカーからのエラーを受信
+
+	// ワーカープール作成
+	// - `p.workerCount` で指定した数のワーカーを生成する。各ワーカーは`worker`関数を実行するゴルーチンとして起動される
+	// - 各ワーカーには一意のID(i)を与え、`jobChan`チャネルからタスクを受け取って処理し、その結果を`resultChan`チャネルに送信する
+	// - ワーカーでエラーが発生した場合は、`errChan`チャネルに送信する
+	var wg sync.WaitGroup
+	for i := 1; i <= c.workerCount; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			if err := worker(ctx, id, jobChan, resultChan, gaijiMap); err != nil {
 				cancel()
 				errChan <- err
 			}
-		}()
-
-		// 結果の集約
-		// - `resultChan`チャネルがcloseするまで受信し、`results`に追加する
-		// - `resultChan`チャネルからの受信後は、`close(done)`によりチャネルをクローズする
-		// - これにより、結果の集約が完了したことを通知する
-		done := make(chan struct{})
-		var results []cmd.Result
-		go func() {
-			defer close(done)
-			results = cmd.CollectResults(resultChan)
-		}()
-
-		// ワーカー完了待機
-		// - `sync.WaitGroup`を使用して、全てのワーカーの処理が完了するの待つ
-		// - 各ワーカーが完了すると`wg.Done`が呼び出され、全てのワーカーが完了すると待機が解除される
-		// - 全てのワーカーが完了し、全てのタスクの処理が終わった後、`resultChan`チャネルと`errChan`チャネルをクローズする
-		// - `resultChan`チャネルをクローズすることで、結果の集約処理が終了する。
-		go func() {
-			slog.Debug("[wg.Wait] START")
-			wg.Wait()
-			close(errChan)
-			close(resultChan)
-			slog.Debug("[wg.Wait] END")
-		}()
-
-		// 完了確認
-		// - 結果の集約処理が完了すると、`close(done)`されるため、待機が解除される
-		<-done
-
-		// エラー確認
-		// goroutineでエラーが発生していなかを、`errChan`チャネルでチェックする
-		err = cmd.CheckError(errChan)
-
-		if err != nil {
-			return subcommands.ExitFailure
-		}
-
-		// 結果のソート
-		// - コードポイント(昇順) > 識別番号(昇順)
-		sort.Slice(results, func(i, j int) bool {
-			if results[i].Codepoint == results[j].Codepoint {
-				// 識別番号には「行数」を格納するため、数字として比較する
-				iVal, _ := strconv.Atoi(results[i].Id)
-				jVal, _ := strconv.Atoi(results[j].Id)
-				return iVal < jVal
-			}
-			return results[i].Codepoint < results[j].Codepoint
-		})
-		slog.Info(fmt.Sprintf("[Execute] END sort.Slice : 抽出結果=%d", len(results)))
-
-		// 結果の出力
-		// - `result`の内容を`p.output`に出力する。
-		err = cmd.WriteOutputFile(outputFile, results, p.header, p.value)
-
-		if err != nil {
-			return subcommands.ExitFailure
-		}
-
-		slog.Info(fmt.Sprintf("処理完了: %s -> %s", inputFile, outputFile))
-
-		cancel() // 次のファイル処理のためにコンテキストをリセット
+		}(i)
 	}
 
-	return subcommands.ExitSuccess
+	// タスク割り当て
+	// - `p.input`ファイルを読み込み、`jobChan`チャネルに送信し、ワーカーに処理させる
+	// - `p.input`の全ての行が`jobChan`チャネルに送信された後、`close(jobChan)`によりチャネルをクローズする。
+	// - これにより、追加のタスクがないことがワーカーに通知される
+	go func() {
+		defer close(jobChan)
+		if err := createJobs(ctx, inputFile, jobChan); err != nil {
+			errChan <- fmt.Errorf("ジョブの生成に失敗しました: %w", err)
+			cancel() // エラー発生時に他のゴルーチンをキャンセル
+		}
+	}()
+
+	// 全てのワーカーが完了したら、結果チャネルを閉じます。
+	// ワーカー完了待機
+	// - `sync.WaitGroup`を使用して、全てのワーカーの処理が完了するの待つ
+	// - 各ワーカーが完了すると`wg.Done`が呼び出され、全てのワーカーが完了すると待機が解除される
+	// - 全てのワーカーが完了し、全てのタスクの処理が終わった後、`resultChan`チャネルと`errChan`チャネルをクローズする
+	// - `resultChan`チャネルをクローズすることで、結果の集約処理が終了する。
+	go func() {
+		slog.Debug("[wg.Wait] START")
+		wg.Wait()
+		close(resultChan)
+		close(errChan) // ここでerrChanを安全に閉じます
+		slog.Debug("[wg.Wait] END")
+	}()
+
+	// 結果の集約
+	// - `resultChan`チャネルがcloseするまで受信し、`results`に追加する
+	// - `resultChan`チャネルからの受信後は、`close(done)`によりチャネルをクローズする
+	// - これにより、結果の集約が完了したことを通知する
+	results := cmd.CollectResults(resultChan)
+
+	// エラーチャネルをチェックします。
+	// createJobsからエラーが送られてくる可能性があるため、先にチェックします。
+	if err := cmd.CheckError(errChan); err != nil {
+		return err
+	}
+
+	// 結果をソートします。
+	if err := sortResults(results); err != nil {
+		return fmt.Errorf("結果のソートに失敗しました: %w", err)
+	}
+
+	// 結果をファイルに出力します。
+	if err := cmd.WriteOutputFile(outputFile, results, c.header, c.value); err != nil {
+		return fmt.Errorf("結果の出力に失敗しました: %w", err)
+	}
+
+	return nil
+}
+
+// sortResults は検索結果をコードポイントと行番号でソートします。
+func sortResults(results []cmd.Result) error {
+	var sortErr error
+	sort.Slice(results, func(i, j int) bool {
+		if sortErr != nil {
+			return false
+		}
+		if results[i].Codepoint == results[j].Codepoint {
+			// Atoiのエラーを無視せず、適切に処理します。
+			iVal, err := strconv.Atoi(results[i].Id)
+			if err != nil {
+				sortErr = fmt.Errorf("行番号の比較に失敗 (Id: %s): %w", results[i].Id, err)
+				return false
+			}
+			jVal, err := strconv.Atoi(results[j].Id)
+			if err != nil {
+				sortErr = fmt.Errorf("行番号の比較に失敗 (Id: %s): %w", results[j].Id, err)
+				return false
+			}
+			return iVal < jVal
+		}
+		return results[i].Codepoint < results[j].Codepoint
+	})
+
+	slog.Info(fmt.Sprintf("[sortResults] END sort.Slice : 抽出結果=%d", len(results)))
+
+	return sortErr
 }
 
 // createJobs は入力ファイルを読み込み、ジョブチャネルにタスクを送信します。
