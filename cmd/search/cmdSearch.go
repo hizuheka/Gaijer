@@ -79,43 +79,47 @@ func (p *SearchCmd) validate() error {
 
 // Execute はコマンドのメインロジックを実行します。
 func (c *SearchCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...any) subcommands.ExitStatus {
-	slog.Info("searchコマンドを開始します。")
+	slog.Info("searchコマンドを開始します。", "section", "Execute")
 	var hadError bool
 	defer func() {
 		if hadError {
-			slog.Error("コマンドの実行中に1つ以上のエラーが発生しました。")
+			slog.Error("コマンドの実行中に1つ以上のエラーが発生しました。", "section", "Execute")
 		} else {
-			slog.Info("全ての処理が正常に完了しました。")
+			slog.Info("全ての処理が正常に完了しました。", "section", "Execute")
 		}
-		slog.Info("searchコマンドを終了します。")
+		slog.Info("searchコマンドを終了します。", "section", "Execute")
 	}()
 
 	if err := c.validate(); err != nil {
-		slog.Error("引数の検証に失敗しました。", "error", err)
+		slog.Error("引数の検証に失敗しました。", "section", "Execute", "error", err)
 		hadError = true
 		return subcommands.ExitUsageError
 	}
 
 	gaijiMap, err := c.createGaijiMap()
 	if err != nil {
-		slog.Error("外字マップの作成に失敗しました。", "error", err)
+		slog.Error("外字マップの作成に失敗しました。", "section", "Execute", "error", err)
 		hadError = true
 		return subcommands.ExitFailure
 	}
 
 	files, err := os.ReadDir(c.inputFolder)
 	if err != nil {
-		slog.Error("入力フォルダの読み取りに失敗しました。", "folder", c.inputFolder, "error", err)
+		slog.Error("入力フォルダの読み取りに失敗しました。", "section", "Execute", "folder", c.inputFolder, "error", err)
 		hadError = true
 		return subcommands.ExitFailure
 	}
 
 	// 出力フォルダが存在しない場合は作成します。
 	if err := os.MkdirAll(c.outputFolder, 0755); err != nil {
-		slog.Error("出力フォルダの作成に失敗しました。", "folder", c.outputFolder, "error", err)
+		slog.Error("出力フォルダの作成に失敗しました。", "section", "Execute", "folder", c.outputFolder, "error", err)
 		hadError = true
 		return subcommands.ExitFailure
 	}
+
+	// errgroupを作成し、同時に実行するゴルーチンの数を c.workerCount に制限
+	g, _ := errgroup.WithContext(context.Background())
+	g.SetLimit(c.workerCount)
 
 	// 取得したファイルごとに処理を実行
 	for _, file := range files {
@@ -123,18 +127,29 @@ func (c *SearchCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...any) subcom
 			continue
 		}
 
+		// ループ変数をキャプチャしないようにローカル変数にコピー
 		inputFile := filepath.Join(c.inputFolder, file.Name())
 		outputFile := filepath.Join(c.outputFolder, file.Name()+".out")
 
-		slog.Info("ファイルの処理を開始します。", "input", inputFile)
-		if err := c.processFile(inputFile, outputFile, gaijiMap); err != nil {
-			// 一つのファイルでエラーが発生しても処理を止めず、次のファイルに進みます。
-			// エラーはログに出力します。
-			slog.Error("ファイルの処理に失敗しました。", "file", inputFile, "error", err)
-			hadError = true // エラーがあっても次のファイルの処理を続ける
-		} else {
-			slog.Info("ファイルの処理が完了しました。", "output", outputFile)
-		}
+		g.Go(func() error {
+			slog.Info("ファイルの処理を開始します。", "section", "Execute", "input", inputFile)
+			if err := c.processFile(inputFile, outputFile, gaijiMap); err != nil {
+				slog.Error("ファイルの処理に失敗しました。", "section", "Execute", "file", inputFile, "error", err)
+				// エラーを返すと、errgroupが最初のエラーとして記録する
+				// 他のファイルの処理はキャンセルされずに継続される
+				return err
+			}
+			slog.Info("ファイルの処理が完了しました。", "section", "Execute", "output", outputFile)
+			return nil
+		})
+	}
+
+	// すべてのゴルーチンが終了するのを待ち、最初のエラーを取得
+	if err := g.Wait(); err != nil {
+		hadError = true
+		// ログにはすべてのファイル処理のエラーが出力されているが、
+		// ここでは最初のエラーのみが記録される
+		slog.Error("ファイル処理中に1つ以上のエラーが発生しました。", "section", "Execute", "first_error", err)
 	}
 
 	if hadError {
@@ -165,9 +180,8 @@ func (c *SearchCmd) processFile(inputFile, outputFile string, gaijiMap map[rune]
 	}
 
 	// 結果をソートします。
-	if err := sortResults(results); err != nil {
-		return fmt.Errorf("結果のソートに失敗しました: %w", err)
-	}
+	sortResults(results)
+
 	if err := cmd.WriteOutputFile(outputFile, results, c.header, c.value); err != nil {
 		return fmt.Errorf("結果の出力に失敗しました: %w", err)
 	}
@@ -213,19 +227,13 @@ func (c *SearchCmd) runPipeline(inputFile string, gaijiMap map[rune]*cmd.Gaiji) 
 }
 
 // sortResults は検索結果をコードポイントと行番号でソートします。
-func sortResults(results []cmd.Result) error {
-	var sortErr error
+func sortResults(results []cmd.Result) {
 	sort.Slice(results, func(i, j int) bool {
-		if sortErr != nil {
-			return false
-		}
 		if results[i].Codepoint == results[j].Codepoint {
 			return results[i].Id < results[j].Id
 		}
 		return results[i].Codepoint < results[j].Codepoint
 	})
-
-	return sortErr
 }
 
 // createJobs は入力ファイルを1行ずつ読み込み、ジョブチャネルにタスクを送信します。
@@ -245,7 +253,7 @@ func createJobs(ctx context.Context, inputFile string, jobChan chan<- Job) error
 	var readsize int64 // 読み込んだサイズ
 	progressRate := -1
 
-	slog.Debug("ジョブの生成を開始します。", "file", inputFile)
+	slog.Debug("ジョブの生成を開始します。", "section", "createJobs", "file", inputFile)
 	lineNumber := 0
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
@@ -254,7 +262,7 @@ func createJobs(ctx context.Context, inputFile string, jobChan chan<- Job) error
 
 		select {
 		case <-ctx.Done():
-			slog.Warn("ジョブ生成がキャンセルされました。", "file", inputFile)
+			slog.Warn("ジョブ生成がキャンセルされました。", "section", "createJobs", "file", inputFile)
 			return ctx.Err()
 		case jobChan <- Job{LineNumber: lineNumber, Text: line}:
 			readsize += int64(len(scanner.Bytes())) + 1
@@ -271,23 +279,23 @@ func createJobs(ctx context.Context, inputFile string, jobChan chan<- Job) error
 	if err := scanner.Err(); err != nil {
 		return fmt.Errorf("ファイルの読み込み中にエラーが発生しました: %w", err)
 	}
-	slog.Debug("ジョブの生成が完了しました。", "total_jobs", lineNumber)
+	slog.Debug("ジョブの生成が完了しました。", "section", "createJobs", "total_jobs", lineNumber)
 
 	return nil
 }
 
 // worker はジョブチャネルからタスクを受け取り、外字検索を実行して結果を送信します。
 func worker(ctx context.Context, id int, jobs <-chan Job, results chan<- cmd.Result, gaijiMap map[rune]*cmd.Gaiji) {
-	slog.Debug("ワーカーを開始します。", "id", id)
-	defer slog.Debug("ワーカーを終了します。", "id", id)
+	slog.Debug("ワーカーを開始します。", "section", "worker", "id", id)
+	defer slog.Debug("ワーカーを終了します。", "section", "worker", "id", id)
 
 	j := 0
 	for job := range jobs {
 		j++
-		slog.Debug(fmt.Sprintf("[worker] id=%d : processing index=%d", id, j))
+		slog.Debug("processing job", "section", "worker", "id", id, "processing index", j)
 		select {
 		case <-ctx.Done():
-			slog.Warn("ワーカー処理がキャンセルされました。", "id", id)
+			slog.Warn("ワーカー処理がキャンセルされました。", "section", "worker", "id", id)
 			return
 		default:
 			// 1行内で同じ外字を重複して報告しないためのセット
