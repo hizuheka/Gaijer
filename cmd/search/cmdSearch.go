@@ -9,13 +9,12 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
-	"sync"
 
 	"Gaijer/cmd"
 
 	"github.com/google/subcommands"
+	"golang.org/x/sync/errgroup"
 )
 
 // Job はワーカーが処理するタスクを表します。
@@ -178,46 +177,35 @@ func (c *SearchCmd) processFile(inputFile, outputFile string, gaijiMap map[rune]
 
 // runPipeline はワーカープールをセットアップし、ファイル処理を実行します。
 func (c *SearchCmd) runPipeline(inputFile string, gaijiMap map[rune]*cmd.Gaiji) ([]cmd.Result, error) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
+	g, ctx := errgroup.WithContext(context.Background())
 	jobChan := make(chan Job, c.workerCount*jobChanBufferMultiplier)
 	resultChan := make(chan cmd.Result, c.workerCount*resultChanBufferMultiplier)
-	errChan := make(chan error, 1)
 
-	var wg sync.WaitGroup
+	// ワーカーゴルーチンを起動
 	for i := 1; i <= c.workerCount; i++ {
-		wg.Add(1)
-		go func(id int) {
-			defer wg.Done()
+		id := i // ループ変数のキャプチャ問題を防ぐ
+		g.Go(func() error {
 			worker(ctx, id, jobChan, resultChan, gaijiMap)
-		}(i)
+			return nil // workerはエラーを返さない設計のため
+		})
 	}
 
-	go func() {
+	g.Go(func() error {
 		defer close(jobChan)
-		if err := createJobs(ctx, inputFile, jobChan); err != nil {
-			select {
-			case errChan <- err:
-			default:
-			}
-			cancel()
-		}
-	}()
+		// createJobsから返されたエラーはerrgroupによって捕捉される
+		return createJobs(ctx, inputFile, jobChan)
+	})
 
-	// resultChanを閉じるためのgoroutine
+	// すべてのワーカーが終了したらresultChanを閉じるためのゴルーチン
 	go func() {
-		wg.Wait()
+		g.Wait() // ジョブ生成と全ワーカーの終了を待つ
 		close(resultChan)
 	}()
 
 	results := cmd.CollectResults(resultChan)
 
-	// すべての送信元が完了したことが保証された後でerrChanを閉じる。
-	// これをしないと、下の for range がデッドロックする可能性がある。
-	close(errChan)
-	if err := cmd.CheckError(errChan); err != nil {
-		// 最初に見つかったエラーを返す
+	// すべてのゴルーチンが終了するのを待ち、最初のエラーを受け取る
+	if err := g.Wait(); err != nil {
 		return nil, err
 	}
 
@@ -232,18 +220,7 @@ func sortResults(results []cmd.Result) error {
 			return false
 		}
 		if results[i].Codepoint == results[j].Codepoint {
-			// Atoiのエラーを無視せず、適切に処理します。
-			iVal, err := strconv.Atoi(results[i].Id)
-			if err != nil {
-				sortErr = fmt.Errorf("行番号の比較に失敗 (Id: %s): %w", results[i].Id, err)
-				return false
-			}
-			jVal, err := strconv.Atoi(results[j].Id)
-			if err != nil {
-				sortErr = fmt.Errorf("行番号の比較に失敗 (Id: %s): %w", results[j].Id, err)
-				return false
-			}
-			return iVal < jVal
+			return results[i].Id < results[j].Id
 		}
 		return results[i].Codepoint < results[j].Codepoint
 	})
@@ -321,7 +298,7 @@ func worker(ctx context.Context, id int, jobs <-chan Job, results chan<- cmd.Res
 						result := cmd.Result{
 							Moji:      g.Moji,
 							Codepoint: g.Codepoint,
-							Id:        strconv.Itoa(job.LineNumber),
+							Id:        fmt.Sprintf("%08d", job.LineNumber),
 							Value:     strings.Trim(job.Text, `"`),
 						}
 						select {
@@ -336,6 +313,4 @@ func worker(ctx context.Context, id int, jobs <-chan Job, results chan<- cmd.Res
 
 		}
 	}
-
-	return nil
 }
