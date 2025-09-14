@@ -5,6 +5,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -14,10 +15,13 @@ import (
 	"Gaijer/cmd"
 
 	"github.com/google/subcommands"
+	"github.com/vbauerster/mpb/v8"
+	"github.com/vbauerster/mpb/v8/decor"
 	"golang.org/x/sync/errgroup"
 )
 
 // Job はワーカーが処理するタスクを表します。
+// Bytesフィールドを追加して、処理済みバイト数に基づいた進捗更新を可能にします。
 type Job struct {
 	LineNumber int
 	Text       string
@@ -78,6 +82,7 @@ func (p *SearchCmd) validate() error {
 }
 
 // Execute はコマンドのメインロジックを実行します。
+// errgroupを使用してファイル単位の並列処理を制御し、mpbで進捗を表示します。
 func (c *SearchCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...any) subcommands.ExitStatus {
 	slog.Info("searchコマンドを開始します。", "section", "Execute")
 	var hadError bool
@@ -117,6 +122,9 @@ func (c *SearchCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...any) subcom
 		return subcommands.ExitFailure
 	}
 
+	// プログレスバーのコンテナを初期化
+	p := mpb.New()
+
 	// errgroupを作成し、同時に実行するゴルーチンの数を c.workerCount に制限
 	g, _ := errgroup.WithContext(context.Background())
 	g.SetLimit(c.workerCount)
@@ -133,7 +141,7 @@ func (c *SearchCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...any) subcom
 
 		g.Go(func() error {
 			slog.Info("ファイルの処理を開始します。", "section", "Execute", "input", inputFile)
-			if err := c.processFile(inputFile, outputFile, gaijiMap); err != nil {
+			if err := c.processFile(inputFile, outputFile, gaijiMap, p); err != nil {
 				slog.Error("ファイルの処理に失敗しました。", "section", "Execute", "file", inputFile, "error", err)
 				// エラーを返すと、errgroupが最初のエラーとして記録する
 				// 他のファイルの処理はキャンセルされずに継続される
@@ -151,6 +159,9 @@ func (c *SearchCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...any) subcom
 		// ここでは最初のエラーのみが記録される
 		slog.Error("ファイル処理中に1つ以上のエラーが発生しました。", "section", "Execute", "first_error", err)
 	}
+
+	// すべてのプログレスバーの描画が完了するのを待つ
+	p.Wait()
 
 	if hadError {
 		return subcommands.ExitFailure
@@ -173,9 +184,38 @@ func (c *SearchCmd) createGaijiMap() (map[rune]*cmd.Gaiji, error) {
 }
 
 // processFile は単一のファイルに対する処理フローを管理します。
-func (c *SearchCmd) processFile(inputFile, outputFile string, gaijiMap map[rune]*cmd.Gaiji) error {
-	results, err := c.runPipeline(inputFile, gaijiMap)
+// mpb.Progressを受け取り、ファイルごとのプログレスバーを生成します。
+func (c *SearchCmd) processFile(inputFile, outputFile string, gaijiMap map[rune]*cmd.Gaiji, p *mpb.Progress) error {
+	file, err := os.Open(inputFile)
 	if err != nil {
+		return fmt.Errorf("ファイルのオープンに失敗: %w", err)
+	}
+	defer file.Close()
+
+	stat, err := file.Stat()
+	if err != nil {
+		return fmt.Errorf("ファイル情報の取得に失敗: %w", err)
+	}
+
+	// ファイルサイズを最大値としてバーを作成
+	bar := p.New(stat.Size(),
+		mpb.BarStyle().Lbound("╢").Filler("█").Tip("█").Padding("░").Rbound("╟"),
+		mpb.PrependDecorators(
+			decor.Name(filepath.Base(inputFile), decor.WCSyncWidth),
+			decor.CountersKibiByte(" % .2f / % .2f "),
+		),
+		mpb.AppendDecorators(
+			decor.Percentage(decor.WCSyncSpace),
+		),
+	)
+
+	// Readerをバーでラップする
+	proxyReader := bar.ProxyReader(file)
+	defer proxyReader.Close() // proxyReaderもCloseが必要
+
+	results, err := c.runPipeline(proxyReader, gaijiMap)
+	if err != nil {
+		// bar.Abort(false) はProxyReaderがCloseされるときに自動で処理されるので不要
 		return fmt.Errorf("処理パイプラインでエラーが発生しました: %w", err)
 	}
 
@@ -190,7 +230,7 @@ func (c *SearchCmd) processFile(inputFile, outputFile string, gaijiMap map[rune]
 }
 
 // runPipeline はワーカープールをセットアップし、ファイル処理を実行します。
-func (c *SearchCmd) runPipeline(inputFile string, gaijiMap map[rune]*cmd.Gaiji) ([]cmd.Result, error) {
+func (c *SearchCmd) runPipeline(reader io.Reader, gaijiMap map[rune]*cmd.Gaiji) ([]cmd.Result, error) {
 	g, ctx := errgroup.WithContext(context.Background())
 	jobChan := make(chan Job, c.workerCount*jobChanBufferMultiplier)
 	resultChan := make(chan cmd.Result, c.workerCount*resultChanBufferMultiplier)
@@ -207,7 +247,7 @@ func (c *SearchCmd) runPipeline(inputFile string, gaijiMap map[rune]*cmd.Gaiji) 
 	g.Go(func() error {
 		defer close(jobChan)
 		// createJobsから返されたエラーはerrgroupによって捕捉される
-		return createJobs(ctx, inputFile, jobChan)
+		return createJobs(ctx, reader, jobChan)
 	})
 
 	// すべてのワーカーが終了したらresultChanを閉じるためのゴルーチン
@@ -237,45 +277,26 @@ func sortResults(results []cmd.Result) {
 }
 
 // createJobs は入力ファイルを1行ずつ読み込み、ジョブチャネルにタスクを送信します。
-func createJobs(ctx context.Context, inputFile string, jobChan chan<- Job) error {
-	file, err := os.Open(inputFile)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-
-	// ファイルサイズを取得
-	fs, err := file.Stat()
-	if err != nil {
-		return err
-	}
-	filesize := fs.Size()
-	var readsize int64 // 読み込んだサイズ
-	progressRate := -1
-
-	slog.Debug("ジョブの生成を開始します。", "section", "createJobs", "file", inputFile)
+func createJobs(ctx context.Context, reader io.Reader, jobChan chan<- Job) error {
+	slog.Debug("ジョブの生成を開始します。", "section", "createJobs")
 	lineNumber := 0
-	scanner := bufio.NewScanner(file)
+	scanner := bufio.NewScanner(reader)
 	for scanner.Scan() {
 		lineNumber++
-		line := scanner.Text()
+		lineText := scanner.Text()
+		// lineText := string(lineBytes) // 文字列が必要な場合は変換する
 
 		select {
 		case <-ctx.Done():
-			slog.Warn("ジョブ生成がキャンセルされました。", "section", "createJobs", "file", inputFile)
+			slog.Warn("ジョブ生成がキャンセルされました。", "section", "createJobs")
 			return ctx.Err()
-		case jobChan <- Job{LineNumber: lineNumber, Text: line}:
-			readsize += int64(len(scanner.Bytes())) + 1
-			pr := int((float64(readsize) / float64(filesize)) * 100)
-			if progressRate != pr {
-				progressRate = pr
-				fmt.Fprintf(os.Stderr, "\r入力ファイル読込中 (%s): %3d %%", filepath.Base(inputFile), progressRate)
-			}
+		// バイト数も一緒にJobに含めて送信
+		// case jobChan <- Job{LineNumber: lineNumber, Text: line}:
+		case jobChan <- Job{LineNumber: lineNumber, Text: lineText}:
 		}
 
 	}
 
-	fmt.Fprint(os.Stderr, "\r\n")
 	if err := scanner.Err(); err != nil {
 		return fmt.Errorf("ファイルの読み込み中にエラーが発生しました: %w", err)
 	}
@@ -318,7 +339,6 @@ func worker(ctx context.Context, id int, jobs <-chan Job, results chan<- cmd.Res
 					}
 				}
 			}
-
 		}
 	}
 }
