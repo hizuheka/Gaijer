@@ -8,11 +8,12 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"sort"
 	"strings"
-	"sync"
 	"sync/atomic"
+	"syscall"
 
 	"Gaijer/cmd"
 
@@ -23,21 +24,20 @@ import (
 )
 
 // Job はワーカーが処理するタスクを表します。
-// Bytesフィールドを追加して、処理済みバイト数に基づいた進捗更新を可能にします。
 type Job struct {
 	LineNumber int
 	Text       string
-	// Bytes      int // バイト数フィールドを追加
 }
 
 // SearchCmd は 'search' コマンドの構造を定義します。
 type SearchCmd struct {
-	inputFolder  string
-	outputFolder string
-	gaijiFile    string
-	workerCount  int
-	header       bool
-	value        bool
+	inputFolder      string
+	outputFolder     string
+	gaijiFile        string
+	workerCount      int
+	innerWorkerCount int
+	header           bool
+	value            bool
 }
 
 // fileInfo は処理対象ファイルの情報を保持します。
@@ -51,6 +51,8 @@ type fileInfo struct {
 const (
 	jobChanBufferMultiplier    = 100
 	resultChanBufferMultiplier = 10
+	// 1MB以下のファイルは逐次処理する
+	sequentialProcessingThreshold = 1 * 1024 * 1024
 )
 
 func (*SearchCmd) Name() string { return "search" }
@@ -68,6 +70,7 @@ func (p *SearchCmd) SetFlags(f *flag.FlagSet) {
 	f.StringVar(&p.outputFolder, "o", "", "検索結果出力フォルダのパス")
 	f.StringVar(&p.gaijiFile, "g", "", "外字リストファイルのパス")
 	f.IntVar(&p.workerCount, "w", 4, "並行処理数 (デフォルト: 4)")
+	f.IntVar(&p.innerWorkerCount, "inner-w", 4, "ファイル内並行処理数 (デフォルト: 4)")
 	f.BoolVar(&p.header, "header", false, "結果ファイルにヘッダを出力するかどうか")
 	f.BoolVar(&p.value, "value", false, "結果ファイルに値（該当行のテキスト）を出力するかどうか")
 }
@@ -86,25 +89,15 @@ func (p *SearchCmd) validate() error {
 	if p.workerCount <= 0 {
 		return fmt.Errorf("引数 -w (並行処理数) には1以上の整数を指定してください: %d", p.workerCount)
 	}
+	if p.innerWorkerCount <= 0 {
+		return fmt.Errorf("引数 -inner-w (ファイル内並行処理数) には1以上の整数を指定してください: %d", p.innerWorkerCount)
+	}
 
 	return nil
 }
 
 // Execute はワーカープールパターンで並列処理を実行します。
-func (c *SearchCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...any) subcommands.ExitStatus {
-	// --- ステップ1: 現在のslog設定を保存し、deferで復元を予約 ---
-	originalLogger := slog.Default()
-	defer slog.SetDefault(originalLogger)
-
-	// --- ステップ2: 新しいロガーを、現在のレベルを引き継いで作成 ---
-	p := mpb.New(mpb.WithAutoRefresh())
-	// 現在のログレベルを検知
-	currentLevel := getCurrentSlogLevel()
-	// mpbコンテナ(p)を出力先とし、検知したレベルで新しいハンドラを作成
-	handler := slog.NewTextHandler(p, &slog.HandlerOptions{Level: currentLevel})
-	// 新しいロガーを作成し、デフォルトに設定（この関数内でのみ有効）
-	slog.SetDefault(slog.New(handler))
-
+func (c *SearchCmd) Execute(ctx context.Context, f *flag.FlagSet, _ ...any) subcommands.ExitStatus {
 	slog.Info("searchコマンドを開始します。")
 	var hadError bool
 	defer func() {
@@ -115,6 +108,27 @@ func (c *SearchCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...any) subcom
 		}
 		slog.Info("searchコマンドを終了します。")
 	}()
+
+	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	p := mpb.New(mpb.WithAutoRefresh())
+
+	// --- ステップ1: 現在のslog設定を保存し、deferで復元を予約 ---
+	// 現在のslogを再設定する方法では期待どおりの動作しなかったのえ、slogを設定しなおしている
+	currentLevel := getCurrentSlogLevel() // 現在のログレベルを検知
+	// originalLogger := slog.Default()  // <- これが期待通りに動作しない。ログが出力されなくなってしまう
+	defer func() {
+		// slog.SetDefault(originalLogger)
+		handler := slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: currentLevel})
+		slog.SetDefault(slog.New(handler))
+	}()
+
+	// --- ステップ2: 新しいロガーを、現在のレベルを引き継いで作成 ---
+	// mpbコンテナ(p)を出力先とし、検知したレベルで新しいハンドラを作成
+	handler := slog.NewTextHandler(p, &slog.HandlerOptions{Level: currentLevel})
+	// 新しいロガーを作成し、デフォルトに設定（この関数内でのみ有効）
+	slog.SetDefault(slog.New(handler))
 
 	if err := c.validate(); err != nil {
 		slog.Error("引数の検証に失敗しました。", "error", err)
@@ -142,17 +156,9 @@ func (c *SearchCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...any) subcom
 	}
 
 	// 全体進捗バーの作成
-	// p := mpb.New(mpb.WithAutoRefresh())
 	var processedFiles atomic.Int64
 	totalFiles := len(filesToProcess)
 
-	fileCounterDecorator := decor.Any(func(statistics decor.Statistics) string {
-		count := processedFiles.Load()
-		return fmt.Sprintf("(Files: %d/%d)", count, totalFiles)
-	}, decor.WCSyncWidth)
-
-	// overallBar := p.New(totalSize,
-	// mpb.BarStyle().Lbound("╢").Filler("█").Tip("█").Padding("░").Rbound("╟"),
 	overallBar := p.AddBar(totalSize,
 		mpb.PrependDecorators(
 			decor.Name("全体", decor.WCSyncWidth),
@@ -160,69 +166,93 @@ func (c *SearchCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...any) subcom
 		),
 		mpb.AppendDecorators(
 			decor.Percentage(decor.WCSyncSpace),
-			fileCounterDecorator,
+			decor.Any(func(s decor.Statistics) string {
+				return fmt.Sprintf("(Files: %d/%d)", processedFiles.Load(), totalFiles)
+			}, decor.WCSyncWidth),
+			// fileCounterDecorator,
 		),
 	)
 
-	var wg sync.WaitGroup
+	g, gCtx := errgroup.WithContext(ctx)
+	g.SetLimit(c.workerCount)
+	// var wg sync.WaitGroup
 	jobs := make(chan fileInfo, len(filesToProcess))
-
-	barOptionsBase :=
-		mpb.AppendDecorators(
-			decor.OnComplete(decor.Percentage(decor.WC{W: 3}), "✓"),
-		)
-	// style := mpb.BarStyle().Lbound("╢").Filler("█").Tip("█").Padding("░").Rbound("╟")
-
-	for i := 0; i < c.workerCount; i++ {
-		wg.Add(1)
-
-		go func(i int) {
-			defer wg.Done()
-
-			for currentFile := range jobs {
-				// 0バイトのファイルは処理をスキップする
-				if currentFile.size == 0 {
-					slog.Info("0バイトのファイルをスキップします。", "file", currentFile.path)
-					// 全体進捗だけを更新して、このファイルの処理を完了とする
-					overallBar.IncrInt64(0) // 念のため
-					processedFiles.Add(1)
-					continue // 次のジョブへ
-				}
-				// 新しいファイル処理のたびに、新しいバーを動的に作成する
-				var barOptions []mpb.BarOption
-				barOptions = append(barOptions,
-					mpb.PrependDecorators(
-						decor.Name(fmt.Sprintf("W%d:", i+1), decor.WCSyncWidth),
-						decor.Name(currentFile.path, decor.WCSyncWidth),
-					))
-				barOptions = append(barOptions, mpb.BarRemoveOnComplete())
-				barOptions = append(barOptions, barOptionsBase)
-				// 以前のバーがあれば、その後ろにキューイングする
-				bar := p.AddBar(currentFile.size, barOptions...)
-				// workerbar[workerID] = p.New(currentFile.size, style, barOptions...)
-
-				inputFile := filepath.Join(c.inputFolder, currentFile.path)
-				outputFile := filepath.Join(c.outputFolder, currentFile.path+".out")
-				if err := c.processFile(inputFile, outputFile, gaijiMap, bar); err != nil {
-					slog.Error("ファイルの処理に失敗しました。", "file", inputFile, "error", err)
-					hadError = true
-					bar.Abort(false)
-				}
-
-				// 正常完了の場合、barは自動的に100%になりCompleted状態になる
-				overallBar.IncrInt64(currentFile.size)
-				processedFiles.Add(1)
-			}
-		}(i) // ループ変数 i をキャプチャさせない
-	}
 
 	for _, file := range filesToProcess {
 		jobs <- file
 	}
 	close(jobs)
 
-	wg.Wait()
+	for i := 0; i < c.workerCount; i++ {
+		g.Go(func() error {
+			for {
+				select {
+				case <-gCtx.Done():
+					return gCtx.Err()
+				case currentFile, ok := <-jobs:
+					if !ok {
+						return nil
+					}
 
+					if currentFile.size == 0 {
+						slog.Info("0バイトのファイルを処理し、空の出力ファイルを作成します。", "file", currentFile.path)
+
+						// 出力ファイルパスを作成
+						outputFile := filepath.Join(c.outputFolder, currentFile.path+".out")
+
+						// 空のファイルを作成
+						file, err := os.Create(outputFile)
+						if err != nil {
+							slog.Error("空の出力ファイルの作成に失敗しました。", "file", outputFile, "error", err)
+							hadError = true // エラーがあったことを記録
+						} else {
+							// 作成したらすぐに閉じる
+							file.Close()
+						}
+
+						// 全体進捗を更新して、このファイルの処理を完了とする
+						processedFiles.Add(1)
+						// overallBarは0バイトなので進めない
+
+						continue // 次のジョブへ
+					}
+
+					bar := p.AddBar(currentFile.size,
+						mpb.BarRemoveOnComplete(),
+						mpb.PrependDecorators(
+							decor.Name(fmt.Sprintf("W%d:", i+1), decor.WCSyncWidth),
+							decor.Name(currentFile.path, decor.WCSyncWidth),
+						),
+						mpb.AppendDecorators(
+							decor.OnComplete(decor.Percentage(decor.WC{W: 3}), "✓"),
+						),
+					)
+
+					inputFile := filepath.Join(c.inputFolder, currentFile.path)
+					outputFile := filepath.Join(c.outputFolder, currentFile.path+".out")
+					err := c.processFile(gCtx, inputFile, outputFile, gaijiMap, bar)
+
+					if err != nil {
+						// context canceled errorは正常終了の一部なのでログレベルを下げる
+						if err == context.Canceled {
+							slog.Warn("contextのキャンセルによりファイル処理が中断されました。", "file", inputFile)
+						} else {
+							slog.Error("ファイルの処理に失敗しました。", "file", inputFile, "error", err)
+							hadError = true
+						}
+						bar.Abort(false)
+						// エラーが発生しても他のファイルの処理を続けるため、errgroupにはエラーを返さない
+					}
+
+					overallBar.IncrInt64(currentFile.size)
+					processedFiles.Add(1)
+				}
+			}
+		})
+	}
+	if err := g.Wait(); err != nil {
+		hadError = true
+	}
 	p.Wait()
 
 	if hadError {
@@ -270,70 +300,99 @@ func (c *SearchCmd) createGaijiMap() (map[rune]*cmd.Gaiji, error) {
 }
 
 // processFile は単一ファイルに対する処理フロー。
-func (c *SearchCmd) processFile(inputFile, outputFile string, gaijiMap map[rune]*cmd.Gaiji, bar *mpb.Bar) error {
+// processFile はファイルサイズに基づき、逐次処理と並行処理を切り替える司令塔として機能します。
+func (c *SearchCmd) processFile(ctx context.Context, inputFile, outputFile string, gaijiMap map[rune]*cmd.Gaiji, bar *mpb.Bar) error {
+	stat, err := os.Stat(inputFile)
+	if err != nil {
+		return fmt.Errorf("ファイル情報の取得に失敗: %w", err)
+	}
+	if stat.Size() < sequentialProcessingThreshold {
+		slog.Debug("ファイルサイズが小さいため、逐次処理を開始します。", "file", inputFile)
+		return c.processFileSequentially(ctx, inputFile, outputFile, gaijiMap, bar)
+	}
+	slog.Debug("ファイルサイズが大きいため、並行処理を開始します。", "file", inputFile)
+	return c.processFileInParallel(ctx, inputFile, outputFile, gaijiMap, bar)
+}
+
+// processFileInParallel は、巨大なファイルに対して並行パイプライン処理を実行します。
+func (c *SearchCmd) processFileInParallel(ctx context.Context, inputFile, outputFile string, gaijiMap map[rune]*cmd.Gaiji, bar *mpb.Bar) error {
 	file, err := os.Open(inputFile)
 	if err != nil {
 		return fmt.Errorf("ファイルのオープンに失敗: %w", err)
 	}
 	defer file.Close()
-
 	proxyReader := bar.ProxyReader(file)
 	defer proxyReader.Close()
-
-	// results, err := c.runPipeline(proxyReader, gaijiMap, bar)
-	results, err := c.runPipeline(proxyReader, gaijiMap)
+	results, err := c.runPipeline(ctx, proxyReader, gaijiMap)
 	if err != nil {
-		// bar.Abort(false) はProxyReaderがCloseされるときに自動で処理されるので不要
 		return fmt.Errorf("処理パイプラインでエラーが発生しました: %w", err)
 	}
-
-	// 結果をソートします。
 	sortResults(results)
-
 	if err := cmd.WriteOutputFile(outputFile, results, c.header, c.value); err != nil {
 		return fmt.Errorf("結果の出力に失敗しました: %w", err)
 	}
+	return nil
+}
 
+// processFileSequentially は、小さなファイルに対して単純な逐次処理を実行します。
+func (c *SearchCmd) processFileSequentially(ctx context.Context, inputFile, outputFile string, gaijiMap map[rune]*cmd.Gaiji, bar *mpb.Bar) error {
+	file, err := os.Open(inputFile)
+	if err != nil {
+		return fmt.Errorf("ファイルのオープンに失敗: %w", err)
+	}
+	defer file.Close()
+	var allResults []cmd.Result
+	proxyReader := bar.ProxyReader(file)
+	defer proxyReader.Close()
+	scanner := bufio.NewScanner(proxyReader)
+	lineNumber := 0
+	for scanner.Scan() {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			lineNumber++
+			lineResults := searchLine(scanner.Text(), lineNumber, gaijiMap)
+			if len(lineResults) > 0 {
+				allResults = append(allResults, lineResults...)
+			}
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("ファイルの読み込み中にエラーが発生しました: %w", err)
+	}
+	sortResults(allResults)
+	if err := cmd.WriteOutputFile(outputFile, allResults, c.header, c.value); err != nil {
+		return fmt.Errorf("結果の出力に失敗しました: %w", err)
+	}
 	return nil
 }
 
 // runPipeline はワーカープールをセットアップし、ファイル処理を実行します。
 // func (c *SearchCmd) runPipeline(reader io.Reader, gaijiMap map[rune]*cmd.Gaiji, bar *mpb.Bar) ([]cmd.Result, error) {
-func (c *SearchCmd) runPipeline(reader io.Reader, gaijiMap map[rune]*cmd.Gaiji) ([]cmd.Result, error) {
+func (c *SearchCmd) runPipeline(ctx context.Context, reader io.Reader, gaijiMap map[rune]*cmd.Gaiji) ([]cmd.Result, error) {
 	g, ctx := errgroup.WithContext(context.Background())
 
-	jobChan := make(chan Job, c.workerCount*jobChanBufferMultiplier)
-	resultChan := make(chan cmd.Result, c.workerCount*resultChanBufferMultiplier)
-
-	// ワーカーゴルーチンを起動
-	for i := 1; i <= c.workerCount; i++ {
-		id := i // ループ変数のキャプチャ問題を防ぐ
-		g.Go(func() error {
-			// worker(ctx, id, jobChan, resultChan, gaijiMap, bar)
-			worker(ctx, id, jobChan, resultChan, gaijiMap)
-			return nil // workerはエラーを返さない設計のため
-		})
-	}
+	jobChan := make(chan Job, c.innerWorkerCount*jobChanBufferMultiplier)
+	resultChan := make(chan cmd.Result, c.innerWorkerCount*resultChanBufferMultiplier)
 
 	g.Go(func() error {
 		defer close(jobChan)
-		// createJobsから返されたエラーはerrgroupによって捕捉される
 		return createJobs(ctx, reader, jobChan)
 	})
-
-	// すべてのワーカーが終了したらresultChanを閉じるためのゴルーチン
+	for i := 0; i < c.innerWorkerCount; i++ {
+		g.Go(func() error {
+			return worker(ctx, i, jobChan, resultChan, gaijiMap)
+		})
+	}
 	go func() {
-		g.Wait() // ジョブ生成と全ワーカーの終了を待つ
+		g.Wait()
 		close(resultChan)
 	}()
-
 	results := cmd.CollectResults(resultChan)
-
-	// すべてのゴルーチンが終了するのを待ち、最初のエラーを受け取る
 	if err := g.Wait(); err != nil {
 		return nil, err
 	}
-
 	return results, nil
 }
 
@@ -351,44 +410,15 @@ func sortResults(results []cmd.Result) {
 func createJobs(ctx context.Context, reader io.Reader, jobChan chan<- Job) error {
 	slog.Debug("ジョブの生成を開始します。", "section", "createJobs")
 	lineNumber := 0
-	// r := bufio.NewReader(reader)
 	scanner := bufio.NewScanner(reader)
 
-	// for {
 	for scanner.Scan() {
 		lineNumber++
-		// // '\n' を区切り文字として、改行コードを含む文字列を読み取る
-		// line, err := r.ReadString('\n')
-		// lineBytes := len([]byte(line)) + 1 // +1は \n の分
-		line := scanner.Text()
-		// lineText := string(lineBytes) // 文字列が必要な場合は変換する
-
-		// 読み込んだデータがある場合は、エラーが発生していてもジョブとして処理する
-		// (ファイルの最終行に改行がない場合など)
-		// if len(line) > 0 {
-		// 	// ReadStringは文字列を返すため、コピーは不要
-		// 	select {
-		// 	case <-ctx.Done():
-		// 		slog.Warn("ジョブ生成がキャンセルされました。", "section", "createJobs")
-		// 		return ctx.Err()
-		// 	case jobChan <- Job{LineNumber: lineNumber, Text: line, Bytes: lineBytes}:
-		// 		// len(line)には改行コードのバイト数も含まれるため、正確な進捗更新が可能
-		// 	}
-		// }
-		// // エラーハンドリング
-		// if err != nil {
-		// 	// ファイルの終端に到達したら、正常にループを抜ける
-		// 	if err == io.EOF {
-		// 		break
-		// 	}
-		// 	// その他のエラーの場合は、エラーを返す
-		// 	return fmt.Errorf("ファイルの読み込み中にエラーが発生しました: %w", err)
-		// }
 		select {
 		case <-ctx.Done():
 			slog.Warn("ジョブ生成がキャンセルされました。", "section", "createJobs")
 			return ctx.Err()
-		case jobChan <- Job{LineNumber: lineNumber, Text: line}:
+		case jobChan <- Job{LineNumber: lineNumber, Text: scanner.Text()}:
 		}
 	}
 
@@ -403,42 +433,49 @@ func createJobs(ctx context.Context, reader io.Reader, jobChan chan<- Job) error
 
 // worker はジョブチャネルからタスクを受け取り、外字検索を実行して結果を送信します。
 // func worker(ctx context.Context, id int, jobs <-chan Job, results chan<- cmd.Result, gaijiMap map[rune]*cmd.Gaiji, bar *mpb.Bar) {
-func worker(ctx context.Context, id int, jobs <-chan Job, results chan<- cmd.Result, gaijiMap map[rune]*cmd.Gaiji) {
+func worker(ctx context.Context, id int, jobs <-chan Job, results chan<- cmd.Result, gaijiMap map[rune]*cmd.Gaiji) error {
 	slog.Debug("ワーカーを開始します。", "section", "worker", "id", id)
 	defer slog.Debug("ワーカーを終了します。", "section", "worker", "id", id)
 
-	j := 0
-	for job := range jobs {
-		j++
-		slog.Debug("processing job", "section", "worker", "id", id, "processing index", j)
+	for {
 		select {
 		case <-ctx.Done():
-			slog.Warn("ワーカー処理がキャンセルされました。", "section", "worker", "id", id)
-			return
-		default:
-			// 1行内で同じ外字を重複して報告しないためのセット
-			foundGaijiInLine := make(map[rune]struct{})
-			for _, char := range job.Text {
-				if g, ok := gaijiMap[char]; ok {
-					if _, found := foundGaijiInLine[char]; !found {
-						result := cmd.Result{
-							Moji:      g.Moji,
-							Codepoint: g.Codepoint,
-							Id:        fmt.Sprintf("%08d", job.LineNumber),
-							Value:     strings.Trim(strings.ReplaceAll(job.Text, "\r\n", ""), `"`),
-						}
-						select {
-						case results <- result:
-						case <-ctx.Done():
-							return
-						}
-						foundGaijiInLine[char] = struct{}{}
-					}
+			return ctx.Err()
+		case job, ok := <-jobs:
+			if !ok {
+				return nil
+			}
+			lineResults := searchLine(job.Text, job.LineNumber, gaijiMap)
+			for _, result := range lineResults {
+				select {
+				case results <- result:
+				case <-ctx.Done():
+					return ctx.Err()
 				}
 			}
-			// bar.IncrBy(job.Bytes)
 		}
 	}
+}
+
+// searchLine は単一の行を検索し、見つかった外字の結果スライスを返します。
+func searchLine(lineText string, lineNumber int, gaijiMap map[rune]*cmd.Gaiji) []cmd.Result {
+	var results []cmd.Result
+	foundGaijiInLine := make(map[rune]struct{})
+	for _, char := range lineText {
+		if g, ok := gaijiMap[char]; ok {
+			if _, found := foundGaijiInLine[char]; !found {
+				result := cmd.Result{
+					Moji:      g.Moji,
+					Codepoint: g.Codepoint,
+					Id:        fmt.Sprintf("%08d", lineNumber),
+					Value:     strings.Trim(strings.ReplaceAll(lineText, "\r\n", ""), `"`),
+				}
+				results = append(results, result)
+				foundGaijiInLine[char] = struct{}{}
+			}
+		}
+	}
+	return results
 }
 
 // getCurrentSlogLevel は、現在のデフォルトロガーの有効なログレベルを判定して返します。
