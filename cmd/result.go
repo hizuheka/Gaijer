@@ -32,7 +32,7 @@ func WriteOutputFile(outputFilePath string, results []Result, isOutputHeader boo
 	slog.Debug("[writeOutputFile] START")
 	i := 0
 	defer func() {
-		slog.Info(fmt.Sprintf("[writeOutputFile] END : 出力した行数(ヘッダ除く)=%d", i))
+		slog.Debug(fmt.Sprintf("[writeOutputFile] END : 出力した行数(ヘッダ除く)=%d", i))
 	}()
 
 	// 出力ファイルを開く

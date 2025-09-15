@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 
 	"Gaijer/cmd"
 
@@ -25,6 +27,7 @@ import (
 type Job struct {
 	LineNumber int
 	Text       string
+	// Bytes      int // バイト数フィールドを追加
 }
 
 // SearchCmd は 'search' コマンドの構造を定義します。
@@ -35,6 +38,12 @@ type SearchCmd struct {
 	workerCount  int
 	header       bool
 	value        bool
+}
+
+// fileInfo は処理対象ファイルの情報を保持します。
+type fileInfo struct {
+	path string
+	size int64
 }
 
 // channelBufferMultiplier は、ワーカー数に対するチャネルバッファの倍率です。
@@ -81,92 +90,169 @@ func (p *SearchCmd) validate() error {
 	return nil
 }
 
-// Execute はコマンドのメインロジックを実行します。
-// errgroupを使用してファイル単位の並列処理を制御し、mpbで進捗を表示します。
+// Execute はワーカープールパターンで並列処理を実行します。
 func (c *SearchCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...any) subcommands.ExitStatus {
-	slog.Info("searchコマンドを開始します。", "section", "Execute")
+	// --- ステップ1: 現在のslog設定を保存し、deferで復元を予約 ---
+	originalLogger := slog.Default()
+	defer slog.SetDefault(originalLogger)
+
+	// --- ステップ2: 新しいロガーを、現在のレベルを引き継いで作成 ---
+	p := mpb.New(mpb.WithAutoRefresh())
+	// 現在のログレベルを検知
+	currentLevel := getCurrentSlogLevel()
+	// mpbコンテナ(p)を出力先とし、検知したレベルで新しいハンドラを作成
+	handler := slog.NewTextHandler(p, &slog.HandlerOptions{Level: currentLevel})
+	// 新しいロガーを作成し、デフォルトに設定（この関数内でのみ有効）
+	slog.SetDefault(slog.New(handler))
+
+	slog.Info("searchコマンドを開始します。")
 	var hadError bool
 	defer func() {
 		if hadError {
-			slog.Error("コマンドの実行中に1つ以上のエラーが発生しました。", "section", "Execute")
+			slog.Error("コマンドの実行中に1つ以上のエラーが発生しました。")
 		} else {
-			slog.Info("全ての処理が正常に完了しました。", "section", "Execute")
+			slog.Info("全ての処理が正常に完了しました。")
 		}
-		slog.Info("searchコマンドを終了します。", "section", "Execute")
+		slog.Info("searchコマンドを終了します。")
 	}()
 
 	if err := c.validate(); err != nil {
-		slog.Error("引数の検証に失敗しました。", "section", "Execute", "error", err)
-		hadError = true
+		slog.Error("引数の検証に失敗しました。", "error", err)
 		return subcommands.ExitUsageError
 	}
 
 	gaijiMap, err := c.createGaijiMap()
 	if err != nil {
-		slog.Error("外字マップの作成に失敗しました。", "section", "Execute", "error", err)
+		slog.Error("外字マップの作成に失敗しました。", "error", err)
 		hadError = true
 		return subcommands.ExitFailure
 	}
 
-	files, err := os.ReadDir(c.inputFolder)
+	filesToProcess, totalSize, err := c.gatherFiles(c.inputFolder)
 	if err != nil {
-		slog.Error("入力フォルダの読み取りに失敗しました。", "section", "Execute", "folder", c.inputFolder, "error", err)
+		slog.Error("ファイル情報の収集に失敗しました。", "error", err)
 		hadError = true
 		return subcommands.ExitFailure
 	}
 
-	// 出力フォルダが存在しない場合は作成します。
 	if err := os.MkdirAll(c.outputFolder, 0755); err != nil {
-		slog.Error("出力フォルダの作成に失敗しました。", "section", "Execute", "folder", c.outputFolder, "error", err)
+		slog.Error("出力フォルダの作成に失敗しました。", "folder", c.outputFolder, "error", err)
 		hadError = true
 		return subcommands.ExitFailure
 	}
 
-	// プログレスバーのコンテナを初期化
-	p := mpb.New()
+	// 全体進捗バーの作成
+	// p := mpb.New(mpb.WithAutoRefresh())
+	var processedFiles atomic.Int64
+	totalFiles := len(filesToProcess)
 
-	// errgroupを作成し、同時に実行するゴルーチンの数を c.workerCount に制限
-	g, _ := errgroup.WithContext(context.Background())
-	g.SetLimit(c.workerCount)
+	fileCounterDecorator := decor.Any(func(statistics decor.Statistics) string {
+		count := processedFiles.Load()
+		return fmt.Sprintf("(Files: %d/%d)", count, totalFiles)
+	}, decor.WCSyncWidth)
 
-	// 取得したファイルごとに処理を実行
-	for _, file := range files {
-		if file.IsDir() {
-			continue
-		}
+	// overallBar := p.New(totalSize,
+	// mpb.BarStyle().Lbound("╢").Filler("█").Tip("█").Padding("░").Rbound("╟"),
+	overallBar := p.AddBar(totalSize,
+		mpb.PrependDecorators(
+			decor.Name("全体", decor.WCSyncWidth),
+			decor.CountersKibiByte(" % .2f / % .2f "),
+		),
+		mpb.AppendDecorators(
+			decor.Percentage(decor.WCSyncSpace),
+			fileCounterDecorator,
+		),
+	)
 
-		// ループ変数をキャプチャしないようにローカル変数にコピー
-		inputFile := filepath.Join(c.inputFolder, file.Name())
-		outputFile := filepath.Join(c.outputFolder, file.Name()+".out")
+	var wg sync.WaitGroup
+	jobs := make(chan fileInfo, len(filesToProcess))
 
-		g.Go(func() error {
-			slog.Info("ファイルの処理を開始します。", "section", "Execute", "input", inputFile)
-			if err := c.processFile(inputFile, outputFile, gaijiMap, p); err != nil {
-				slog.Error("ファイルの処理に失敗しました。", "section", "Execute", "file", inputFile, "error", err)
-				// エラーを返すと、errgroupが最初のエラーとして記録する
-				// 他のファイルの処理はキャンセルされずに継続される
-				return err
+	barOptionsBase :=
+		mpb.AppendDecorators(
+			decor.OnComplete(decor.Percentage(decor.WC{W: 3}), "✓"),
+		)
+	// style := mpb.BarStyle().Lbound("╢").Filler("█").Tip("█").Padding("░").Rbound("╟")
+
+	for i := 0; i < c.workerCount; i++ {
+		wg.Add(1)
+
+		go func(i int) {
+			defer wg.Done()
+
+			for currentFile := range jobs {
+				// 0バイトのファイルは処理をスキップする
+				if currentFile.size == 0 {
+					slog.Info("0バイトのファイルをスキップします。", "file", currentFile.path)
+					// 全体進捗だけを更新して、このファイルの処理を完了とする
+					overallBar.IncrInt64(0) // 念のため
+					processedFiles.Add(1)
+					continue // 次のジョブへ
+				}
+				// 新しいファイル処理のたびに、新しいバーを動的に作成する
+				var barOptions []mpb.BarOption
+				barOptions = append(barOptions,
+					mpb.PrependDecorators(
+						decor.Name(fmt.Sprintf("W%d:", i+1), decor.WCSyncWidth),
+						decor.Name(currentFile.path, decor.WCSyncWidth),
+					))
+				barOptions = append(barOptions, mpb.BarRemoveOnComplete())
+				barOptions = append(barOptions, barOptionsBase)
+				// 以前のバーがあれば、その後ろにキューイングする
+				bar := p.AddBar(currentFile.size, barOptions...)
+				// workerbar[workerID] = p.New(currentFile.size, style, barOptions...)
+
+				inputFile := filepath.Join(c.inputFolder, currentFile.path)
+				outputFile := filepath.Join(c.outputFolder, currentFile.path+".out")
+				if err := c.processFile(inputFile, outputFile, gaijiMap, bar); err != nil {
+					slog.Error("ファイルの処理に失敗しました。", "file", inputFile, "error", err)
+					hadError = true
+					bar.Abort(false)
+				}
+
+				// 正常完了の場合、barは自動的に100%になりCompleted状態になる
+				overallBar.IncrInt64(currentFile.size)
+				processedFiles.Add(1)
 			}
-			slog.Info("ファイルの処理が完了しました。", "section", "Execute", "output", outputFile)
-			return nil
-		})
+		}(i) // ループ変数 i をキャプチャさせない
 	}
 
-	// すべてのゴルーチンが終了するのを待ち、最初のエラーを取得
-	if err := g.Wait(); err != nil {
-		hadError = true
-		// ログにはすべてのファイル処理のエラーが出力されているが、
-		// ここでは最初のエラーのみが記録される
-		slog.Error("ファイル処理中に1つ以上のエラーが発生しました。", "section", "Execute", "first_error", err)
+	for _, file := range filesToProcess {
+		jobs <- file
 	}
+	close(jobs)
 
-	// すべてのプログレスバーの描画が完了するのを待つ
+	wg.Wait()
+
 	p.Wait()
 
 	if hadError {
 		return subcommands.ExitFailure
 	}
 	return subcommands.ExitSuccess
+}
+
+// gatherFiles は処理対象のファイル情報と合計サイズを収集するヘルパー関数
+func (c *SearchCmd) gatherFiles(inputFolder string) ([]fileInfo, int64, error) {
+	entries, err := os.ReadDir(inputFolder)
+	if err != nil {
+		return nil, 0, fmt.Errorf("入力フォルダの読み取りに失敗: %w", err)
+	}
+
+	var filesToProcess []fileInfo
+	var totalSize int64
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			slog.Warn("ファイル情報の取得に失敗、スキップします。", "file", entry.Name(), "error", err)
+			continue
+		}
+		filesToProcess = append(filesToProcess, fileInfo{path: entry.Name(), size: info.Size()})
+		totalSize += info.Size()
+	}
+	return filesToProcess, totalSize, nil
 }
 
 // createGaijiMap は外字リストファイルを読み込み、検索を高速化するためのマップを作成します。
@@ -183,36 +269,18 @@ func (c *SearchCmd) createGaijiMap() (map[rune]*cmd.Gaiji, error) {
 	return gaijiMap, nil
 }
 
-// processFile は単一のファイルに対する処理フローを管理します。
-// mpb.Progressを受け取り、ファイルごとのプログレスバーを生成します。
-func (c *SearchCmd) processFile(inputFile, outputFile string, gaijiMap map[rune]*cmd.Gaiji, p *mpb.Progress) error {
+// processFile は単一ファイルに対する処理フロー。
+func (c *SearchCmd) processFile(inputFile, outputFile string, gaijiMap map[rune]*cmd.Gaiji, bar *mpb.Bar) error {
 	file, err := os.Open(inputFile)
 	if err != nil {
 		return fmt.Errorf("ファイルのオープンに失敗: %w", err)
 	}
 	defer file.Close()
 
-	stat, err := file.Stat()
-	if err != nil {
-		return fmt.Errorf("ファイル情報の取得に失敗: %w", err)
-	}
-
-	// ファイルサイズを最大値としてバーを作成
-	bar := p.New(stat.Size(),
-		mpb.BarStyle().Lbound("╢").Filler("█").Tip("█").Padding("░").Rbound("╟"),
-		mpb.PrependDecorators(
-			decor.Name(filepath.Base(inputFile), decor.WCSyncWidth),
-			decor.CountersKibiByte(" % .2f / % .2f "),
-		),
-		mpb.AppendDecorators(
-			decor.Percentage(decor.WCSyncSpace),
-		),
-	)
-
-	// Readerをバーでラップする
 	proxyReader := bar.ProxyReader(file)
-	defer proxyReader.Close() // proxyReaderもCloseが必要
+	defer proxyReader.Close()
 
+	// results, err := c.runPipeline(proxyReader, gaijiMap, bar)
 	results, err := c.runPipeline(proxyReader, gaijiMap)
 	if err != nil {
 		// bar.Abort(false) はProxyReaderがCloseされるときに自動で処理されるので不要
@@ -230,8 +298,10 @@ func (c *SearchCmd) processFile(inputFile, outputFile string, gaijiMap map[rune]
 }
 
 // runPipeline はワーカープールをセットアップし、ファイル処理を実行します。
+// func (c *SearchCmd) runPipeline(reader io.Reader, gaijiMap map[rune]*cmd.Gaiji, bar *mpb.Bar) ([]cmd.Result, error) {
 func (c *SearchCmd) runPipeline(reader io.Reader, gaijiMap map[rune]*cmd.Gaiji) ([]cmd.Result, error) {
 	g, ctx := errgroup.WithContext(context.Background())
+
 	jobChan := make(chan Job, c.workerCount*jobChanBufferMultiplier)
 	resultChan := make(chan cmd.Result, c.workerCount*resultChanBufferMultiplier)
 
@@ -239,6 +309,7 @@ func (c *SearchCmd) runPipeline(reader io.Reader, gaijiMap map[rune]*cmd.Gaiji) 
 	for i := 1; i <= c.workerCount; i++ {
 		id := i // ループ変数のキャプチャ問題を防ぐ
 		g.Go(func() error {
+			// worker(ctx, id, jobChan, resultChan, gaijiMap, bar)
 			worker(ctx, id, jobChan, resultChan, gaijiMap)
 			return nil // workerはエラーを返さない設計のため
 		})
@@ -280,32 +351,58 @@ func sortResults(results []cmd.Result) {
 func createJobs(ctx context.Context, reader io.Reader, jobChan chan<- Job) error {
 	slog.Debug("ジョブの生成を開始します。", "section", "createJobs")
 	lineNumber := 0
+	// r := bufio.NewReader(reader)
 	scanner := bufio.NewScanner(reader)
+
+	// for {
 	for scanner.Scan() {
 		lineNumber++
-		lineText := scanner.Text()
+		// // '\n' を区切り文字として、改行コードを含む文字列を読み取る
+		// line, err := r.ReadString('\n')
+		// lineBytes := len([]byte(line)) + 1 // +1は \n の分
+		line := scanner.Text()
 		// lineText := string(lineBytes) // 文字列が必要な場合は変換する
 
+		// 読み込んだデータがある場合は、エラーが発生していてもジョブとして処理する
+		// (ファイルの最終行に改行がない場合など)
+		// if len(line) > 0 {
+		// 	// ReadStringは文字列を返すため、コピーは不要
+		// 	select {
+		// 	case <-ctx.Done():
+		// 		slog.Warn("ジョブ生成がキャンセルされました。", "section", "createJobs")
+		// 		return ctx.Err()
+		// 	case jobChan <- Job{LineNumber: lineNumber, Text: line, Bytes: lineBytes}:
+		// 		// len(line)には改行コードのバイト数も含まれるため、正確な進捗更新が可能
+		// 	}
+		// }
+		// // エラーハンドリング
+		// if err != nil {
+		// 	// ファイルの終端に到達したら、正常にループを抜ける
+		// 	if err == io.EOF {
+		// 		break
+		// 	}
+		// 	// その他のエラーの場合は、エラーを返す
+		// 	return fmt.Errorf("ファイルの読み込み中にエラーが発生しました: %w", err)
+		// }
 		select {
 		case <-ctx.Done():
 			slog.Warn("ジョブ生成がキャンセルされました。", "section", "createJobs")
 			return ctx.Err()
-		// バイト数も一緒にJobに含めて送信
-		// case jobChan <- Job{LineNumber: lineNumber, Text: line}:
-		case jobChan <- Job{LineNumber: lineNumber, Text: lineText}:
+		case jobChan <- Job{LineNumber: lineNumber, Text: line}:
 		}
-
 	}
 
 	if err := scanner.Err(); err != nil {
 		return fmt.Errorf("ファイルの読み込み中にエラーが発生しました: %w", err)
 	}
+
 	slog.Debug("ジョブの生成が完了しました。", "section", "createJobs", "total_jobs", lineNumber)
 
 	return nil
 }
 
 // worker はジョブチャネルからタスクを受け取り、外字検索を実行して結果を送信します。
+// func worker(ctx context.Context, id int, jobs <-chan Job, results chan<- cmd.Result, gaijiMap map[rune]*cmd.Gaiji, bar *mpb.Bar) {
 func worker(ctx context.Context, id int, jobs <-chan Job, results chan<- cmd.Result, gaijiMap map[rune]*cmd.Gaiji) {
 	slog.Debug("ワーカーを開始します。", "section", "worker", "id", id)
 	defer slog.Debug("ワーカーを終了します。", "section", "worker", "id", id)
@@ -328,7 +425,7 @@ func worker(ctx context.Context, id int, jobs <-chan Job, results chan<- cmd.Res
 							Moji:      g.Moji,
 							Codepoint: g.Codepoint,
 							Id:        fmt.Sprintf("%08d", job.LineNumber),
-							Value:     strings.Trim(job.Text, `"`),
+							Value:     strings.Trim(strings.ReplaceAll(job.Text, "\r\n", ""), `"`),
 						}
 						select {
 						case results <- result:
@@ -339,6 +436,23 @@ func worker(ctx context.Context, id int, jobs <-chan Job, results chan<- cmd.Res
 					}
 				}
 			}
+			// bar.IncrBy(job.Bytes)
 		}
 	}
+}
+
+// getCurrentSlogLevel は、現在のデフォルトロガーの有効なログレベルを判定して返します。
+func getCurrentSlogLevel() slog.Level {
+	ctx := context.Background()
+	// 詳細なレベルから順にチェック
+	if slog.Default().Enabled(ctx, slog.LevelDebug) {
+		return slog.LevelDebug
+	}
+	if slog.Default().Enabled(ctx, slog.LevelInfo) {
+		return slog.LevelInfo
+	}
+	if slog.Default().Enabled(ctx, slog.LevelWarn) {
+		return slog.LevelWarn
+	}
+	return slog.LevelError
 }
