@@ -31,13 +31,14 @@ type Job struct {
 
 // SearchCmd は 'search' コマンドの構造を定義します。
 type SearchCmd struct {
-	inputFolder      string
-	outputFolder     string
-	gaijiFile        string
-	workerCount      int
-	innerWorkerCount int
-	header           bool
-	value            bool
+	inputFolder                   string
+	outputFolder                  string
+	gaijiFile                     string
+	workerCount                   int
+	innerWorkerCount              int
+	header                        bool
+	value                         bool
+	sequentialProcessingThreshold int64 // 閾値を格納するフィールドを追加
 }
 
 // fileInfo は処理対象ファイルの情報を保持します。
@@ -51,8 +52,6 @@ type fileInfo struct {
 const (
 	jobChanBufferMultiplier    = 100
 	resultChanBufferMultiplier = 10
-	// 1MB以下のファイルは逐次処理する
-	sequentialProcessingThreshold = 1 * 1024 * 1024
 )
 
 func (*SearchCmd) Name() string { return "search" }
@@ -73,6 +72,8 @@ func (p *SearchCmd) SetFlags(f *flag.FlagSet) {
 	f.IntVar(&p.innerWorkerCount, "inner-w", 4, "ファイル内並行処理数 (デフォルト: 4)")
 	f.BoolVar(&p.header, "header", false, "結果ファイルにヘッダを出力するかどうか")
 	f.BoolVar(&p.value, "value", false, "結果ファイルに値（該当行のテキスト）を出力するかどうか")
+	// -threshold フラグを追加
+	f.Int64Var(&p.sequentialProcessingThreshold, "threshold", 1, "並列/逐次処理を切り替えるファイルサイズの閾値 (MB, デフォルト: 1MB)")
 }
 
 // validate はコマンドライン引数が正しく設定されているか検証します。
@@ -306,7 +307,7 @@ func (c *SearchCmd) processFile(ctx context.Context, inputFile, outputFile strin
 	if err != nil {
 		return fmt.Errorf("ファイル情報の取得に失敗: %w", err)
 	}
-	if stat.Size() < sequentialProcessingThreshold {
+	if stat.Size() < c.sequentialProcessingThreshold*1024*1024 {
 		slog.Debug("ファイルサイズが小さいため、逐次処理を開始します。", "file", inputFile)
 		return c.processFileSequentially(ctx, inputFile, outputFile, gaijiMap, bar)
 	}
