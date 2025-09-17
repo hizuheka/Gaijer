@@ -52,6 +52,7 @@ type fileInfo struct {
 const (
 	jobChanBufferMultiplier    = 100
 	resultChanBufferMultiplier = 10
+	maxScanTokenSize           = 1 * 1024 * 1024 // 1MBに設定
 )
 
 func (*SearchCmd) Name() string { return "search" }
@@ -346,6 +347,10 @@ func (c *SearchCmd) processFileSequentially(ctx context.Context, inputFile, outp
 	proxyReader := bar.ProxyReader(file)
 	defer proxyReader.Close()
 	scanner := bufio.NewScanner(proxyReader)
+	// スキャナのバッファサイズを増やす
+	buf := make([]byte, maxScanTokenSize)
+	scanner.Buffer(buf, maxScanTokenSize)
+
 	lineNumber := 0
 	for scanner.Scan() {
 		select {
@@ -412,6 +417,8 @@ func createJobs(ctx context.Context, reader io.Reader, jobChan chan<- Job) error
 	slog.Debug("ジョブの生成を開始します。", "section", "createJobs")
 	lineNumber := 0
 	scanner := bufio.NewScanner(reader)
+	buf := make([]byte, maxScanTokenSize)
+	scanner.Buffer(buf, maxScanTokenSize)
 
 	for scanner.Scan() {
 		lineNumber++
