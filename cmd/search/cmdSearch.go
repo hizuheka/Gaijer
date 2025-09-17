@@ -466,10 +466,17 @@ func worker(ctx context.Context, id int, jobs <-chan Job, results chan<- cmd.Res
 }
 
 // searchLine は単一の行を検索し、見つかった外字の結果スライスを返します。
+// バイナリデータが含まれている可能性のある行を安全に処理します。
 func searchLine(lineText string, lineNumber int, gaijiMap map[rune]*cmd.Gaiji) []cmd.Result {
+	// バイナリデータを無害化（サニタイズ）する
+	// 不正なUTF-8シーケンスを置換文字に置き換え、NULLバイトを完全に除去する
+	sanitizedText := strings.ToValidUTF8(lineText, string(rune(0xFFFD)))
+	sanitizedText = strings.ReplaceAll(sanitizedText, "\x00", "")
+
 	var results []cmd.Result
 	foundGaijiInLine := make(map[rune]struct{})
-	for _, char := range lineText {
+
+	for _, char := range sanitizedText { // 無害化されたテキストを検索する
 		if g, ok := gaijiMap[char]; ok {
 			if _, found := foundGaijiInLine[char]; !found {
 				result := cmd.Result{
