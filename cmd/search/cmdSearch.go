@@ -197,7 +197,7 @@ func (c *SearchCmd) Execute(ctx context.Context, f *flag.FlagSet, _ ...any) subc
 					}
 
 					if currentFile.size == 0 {
-						slog.Info("0バイトのファイルを処理し、空の出力ファイルを作成します。", "file", currentFile.path)
+						slog.Debug("0バイトのファイルを処理し、空の出力ファイルを作成します。", "file", currentFile.path)
 
 						// 出力ファイルパスを作成
 						outputFile := filepath.Join(c.outputFolder, currentFile.path+".out")
