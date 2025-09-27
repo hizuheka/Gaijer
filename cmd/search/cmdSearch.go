@@ -129,8 +129,6 @@ func (c *SearchCmd) Execute(ctx context.Context, f *flag.FlagSet, _ ...any) subc
 	// --- ステップ2: 新しいロガーを、現在のレベルを引き継いで作成 ---
 	// mpbコンテナ(p)を出力先とし、検知したレベルで新しいハンドラを作成
 	handler := slog.NewTextHandler(p, &slog.HandlerOptions{Level: currentLevel})
-	// 新しいロガーを作成し、デフォルトに設定（この関数内でのみ有効）
-	slog.SetDefault(slog.New(handler))
 
 	if err := c.validate(); err != nil {
 		slog.Error("引数の検証に失敗しました。", "error", err)
@@ -184,6 +182,9 @@ func (c *SearchCmd) Execute(ctx context.Context, f *flag.FlagSet, _ ...any) subc
 		jobs <- file
 	}
 	close(jobs)
+
+	// 新しいロガーを作成し、デフォルトに設定（この関数内でのみ有効）
+	slog.SetDefault(slog.New(handler))
 
 	for i := 0; i < c.workerCount; i++ {
 		g.Go(func() error {
