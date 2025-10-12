@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 
+	"Gaijer/cmd/analyze"
 	"Gaijer/cmd/find"
 	"Gaijer/cmd/search"
 
@@ -21,6 +22,7 @@ func main() {
 	subcommands.Register(subcommands.CommandsCommand(), "")
 	subcommands.Register(&find.FindCmd{}, "")
 	subcommands.Register(&search.SearchCmd{}, "")
+	subcommands.Register(&analyze.AnalyzeCmd{}, "")
 
 	isDebug := flag.Bool("d", false, "debugログを出力")
 	isVersion := flag.Bool("v", false, "バージョンを出力")
