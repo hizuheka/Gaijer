@@ -288,7 +288,7 @@ func readAnalyzeCSV(filePath string) ([]AnalyzeRecord, error) {
 		records = append(records, AnalyzeRecord{
 			CharCode: CharCode(line[0]),
 			Char:     []rune(line[1])[0],
-			AtenaNo:  extractAtenaNo(line[3])})
+			AtenaNo:  extractAtenaNo(line[2])})
 	}
 	return records, nil
 }
