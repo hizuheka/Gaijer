@@ -104,8 +104,7 @@ func (c *AnalyzeCmd) Execute(ctx context.Context, f *flag.FlagSet, _ ...any) sub
 
 // atenaInfo は各宛名番号の情報を保持する構造体です。
 type atenaInfo struct {
-	chars      CharSet // この宛名番号が持つ文字のセット
-	coverCount int     // この宛名番号がカバーできる「未カバー文字」の数
+	chars CharSet // この宛名番号が持つ文字のセット
 }
 
 // analyzeRecords は、Recordのスライスを受け取り、分析のコアロジックを実行します。
@@ -120,8 +119,6 @@ func analyzeRecords(ctx context.Context, records []AnalyzeRecord) (result map[ru
 	// 分析開始時点での、全てのユニークな文字のリストです。分析が進むにつれて、このリストから文字が消えていきます。
 	uncoveredChars := make(CharSet)      // まだカバーされていない文字のセット
 	charToCode = make(map[rune]CharCode) // 文字から文字コードへのマッピング
-	// これがアルゴリズムを高速化する最大の工夫です。各文字が「どの宛名番号で使われているか」を逆引きできるようにした索引です。例えば、「'亜' -> [1001, 1005, 1007]」のように記録します。
-	charToAtenas := make(map[rune][]AtenaNo) // 文字からそれを含む宛名番号のリストへのマッピング
 
 	for _, rec := range records {
 		// atenaDataへの追加(初回のみ)
@@ -143,9 +140,6 @@ func analyzeRecords(ctx context.Context, records []AnalyzeRecord) (result map[ru
 		} else {
 			charToCode[rec.Char] = rec.CharCode
 		}
-
-		// charToAtenasへの追加
-		charToAtenas[rec.Char] = append(charToAtenas[rec.Char], rec.AtenaNo)
 	}
 	slog.Info("データ構造の構築が完了しました。", "記録した宛名番号", len(atenaData), "記録した文字数", len(uncoveredChars))
 
@@ -153,11 +147,6 @@ func analyzeRecords(ctx context.Context, records []AnalyzeRecord) (result map[ru
 	if len(uncoveredChars) == 0 {
 		slog.Warn("分析対象となる有効な文字が見つかりませんでした。")
 		return make(map[rune]AtenaNo), charToCode, nil
-	}
-
-	// 各宛名番号がカバーできる「未カバー文字」の数を初期化します。
-	for _, info := range atenaData {
-		info.coverCount = len(info.chars)
 	}
 
 	slog.Info("貪欲法による宛名番号の選択を開始します...")
@@ -176,62 +165,58 @@ func analyzeRecords(ctx context.Context, records []AnalyzeRecord) (result map[ru
 		var bestAtena AtenaNo
 		maxCoverCount := -1
 
-		// 全宛名番号の中から、現時点で最も多くの「未発見の文字」を持っている宛名番号（bestAtena）を一人だけ選び出します。これが「貪欲法」と呼ばれる所以で、常に目先の利益が最大になる選択をします。
+		// 毎回、現在の未カバー文字を最も多くカバーできる宛名番号を数え直す
 		for atena, info := range atenaData {
-			if info.coverCount > maxCoverCount {
-				maxCoverCount = info.coverCount
+			currentCover := 0
+			for char := range info.chars {
+				if _, ok := uncoveredChars[char]; ok {
+					currentCover++
+				}
+			}
+			if currentCover > maxCoverCount {
+				maxCoverCount = currentCover
 				bestAtena = atena
 			}
 		}
 
-		// もしmaxCoverCountが0以下なら、これ以上カバーできる文字がないことを意味します。ループを終了します。
+		// 全ての文字がカバーされていれば、maxCoverCountは0になり、ループを正常に抜ける
 		if maxCoverCount <= 0 {
-			var uncoveredList []string
-			// 未カバー文字の例をいくつか収集してログに出力します。
-			for char := range uncoveredChars {
-				uncoveredList = append(uncoveredList, string(char))
-				if len(uncoveredList) >= 10 {
-					uncoveredList = append(uncoveredList, "...")
-					break
-				}
-			}
-			slog.Warn("これ以上カバーできる文字がありません。",
-				"未発見文字数", len(uncoveredChars),
-				"未発見文字", strings.Join(uncoveredList, ", "))
 			break
 		}
 
-		newlyCoveredChars := 0
 		// 見つけ出したbestAtenaが持っている文字を全て確認します。
 		charsToCover := atenaData[bestAtena].chars // bestAtenaがカバーする文字のセット
+
+		newlyCovered := 0
 		for char := range charsToCover {
 			// その中に「未発見」の文字があれば、それを「発見済み」とし、結果リスト（result）に「この文字はbestAtenaで見つけました」と記録します。
 			// 発見した文字を「未発見の文字リスト (uncoveredChars)」から削除します。
 			if _, ok := uncoveredChars[char]; ok {
 				result[char] = bestAtena
 				delete(uncoveredChars, char)
-				newlyCoveredChars++
-
-				// ここで逆引き索引 (charToAtenas) が活躍します。
-				// 例えば、bestAtenaによって文字「絵」が発見されたとします。逆引き索引を引くと、「絵」は「宛名番号1002」と「宛名番号1003」の両方に含まれていたことが分かります。
-				// 「絵」はもう発見済みなので、宛名番号1002と1003の「未発見の文字を発見できる数 (coverCount)」をそれぞれ1つずつ減らします。
-				// この工夫により、次のループで再度全てのカバー数を数え直す必要がなくなり、計算速度が劇的に向上します。
-				for _, atenaToUpdate := range charToAtenas[char] {
-					if info, ok := atenaData[atenaToUpdate]; ok && info.coverCount > 0 {
-						info.coverCount--
-					}
-				}
+				newlyCovered++
 			}
 		}
 
 		// 進捗状況の出力
 		progress := 100 * (1 - float64(len(uncoveredChars))/float64(totalChars))
-		slog.Info("処理中...", "進捗率", fmt.Sprintf("%.2f%%", progress), "選択済み宛名番号", bestAtena, "発見済みとした文字数", newlyCoveredChars, "残っている文字数", len(uncoveredChars))
+		slog.Info("処理中...", "進捗率", fmt.Sprintf("%.2f%%", progress), "選択済み宛名番号", bestAtena, "発見済みとした文字数", newlyCovered, "残っている文字数", len(uncoveredChars))
 	}
 
-	// 最終的な統計情報の出力
-	// 全ての未発見文字がなくなるか、これ以上発見できる文字がなくなるとループが終了します。
-	// 最後に、今回の分析で「合計でいくつの文字がカバーできたか」「そのためにいくつのユニークな宛名番号が使われたか」といった統計情報をログに出力します。
+	if len(uncoveredChars) > 0 {
+		var uncoveredList []string
+		for char := range uncoveredChars {
+			uncoveredList = append(uncoveredList, string(char))
+			if len(uncoveredList) >= 10 {
+				uncoveredList = append(uncoveredList, "...")
+				break
+			}
+		}
+		slog.Error("アルゴリズムが終了しましたが、未カバーの文字が残っています。入力データに問題がある可能性があります。",
+			"uncovered_count", len(uncoveredChars),
+			"examples", strings.Join(uncoveredList, ", "))
+	}
+
 	atenaUsed := make(map[AtenaNo]struct{})
 	for _, atena := range result {
 		atenaUsed[atena] = struct{}{}
@@ -251,7 +236,7 @@ func readAnalyzeCSV(filePath string) ([]AnalyzeRecord, error) {
 	defer file.Close()
 
 	reader := csv.NewReader(file)
-	// reader.FieldsPerRecord = -1
+	reader.FieldsPerRecord = -1
 	reader.TrimLeadingSpace = true
 
 	var records []AnalyzeRecord
@@ -341,7 +326,3 @@ func writeAnalyzeResult(filePath string, result map[rune]AtenaNo, charToCode map
 
 	return nil
 }
-
-// bomSkipper は bomSkipper.go または共通のutil.goファイルに移動することを推奨
-// (この関数は search.go と共通なので、別ファイルに切り出すのが理想)
-// func bomSkipper(r io.Reader) io.Reader { ... }
